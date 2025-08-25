@@ -3,8 +3,8 @@ import tkinter as tk
 from tkinter import font as tkfont
 import cv2
 from PIL import Image, ImageTk
-from datetime import datetime
-import os, sys, json, csv
+from datetime import datetime, timedelta
+import os, sys, json, csv, random
 from tkinter import filedialog, messagebox
 
 
@@ -18,7 +18,7 @@ class LeafPlateDetectionApp:
     def __init__(self):
         self.initialize_data()
         self.setup_app()
-        self.setup_fonts()       # <- บังคับให้ทั้งแอปใช้ Arial
+        self.setup_fonts()
         self.setup_camera()
         self.create_widgets()
         self.create_mock_data()
@@ -28,39 +28,27 @@ class LeafPlateDetectionApp:
     # Layout constants for Full HD
     # -----------------------------
     def set_layout_constants(self):
-        # Window size
         self.W, self.H = 1920, 1080
-
-        # Margins / heights
-        self.M = 25                       # outer margin
+        self.M = 25
         self.HEADER_Y, self.HEADER_H = 20, 90
-
-        self.TOP_Y = 120                  # y of top panels (left/right)
-        self.TOP_H = 640                  # higher to give camera more room
+        self.TOP_Y = 120
+        self.TOP_H = 640
         self.GAP = self.M
-
-        # Widths: left wider (focus on camera)
         self.header_w = self.W - 2 * self.M
-        self.left_w = int(self.header_w * 0.58)          # ~58%
+        self.left_w = int(self.header_w * 0.58)
         self.right_w = self.header_w - self.left_w - self.GAP
-
-        # Bottom panel — pushed down a bit, shorter height
-        self.BOTTOM_Y = self.TOP_Y + self.TOP_H + 20      # 120 + 640 + 20 = 780
-        self.BOTTOM_H = self.H - self.BOTTOM_Y - self.M   # ≈ 275
+        self.BOTTOM_Y = self.TOP_Y + self.TOP_H + 20
+        self.BOTTOM_H = self.H - self.BOTTOM_Y - self.M
         self.bottom_w = self.header_w
-
-        # Camera area inside left panel
         self.cam_pad = 20
-        self.cam_h = 540                                  # larger camera view
+        self.cam_h = 540
         self.cam_w = self.left_w - (self.cam_pad * 2)
 
     # -----------------------------
     # Fonts (force Arial)
     # -----------------------------
     def setup_fonts(self):
-        self.FONT_FAMILY = "THSarabun" if sys.platform == "win32" else "Arial"
-
-        # ตั้งค่า default ของ Tk ให้เป็น Arial (เผื่อวิดเจ็ต tk ที่ไม่ได้กำหนดฟอนต์เอง)
+        self.FONT_FAMILY = "Arial"
         for name in (
             "TkDefaultFont", "TkHeadingFont", "TkTextFont", "TkMenuFont",
             "TkFixedFont", "TkTooltipFont", "TkCaptionFont",
@@ -70,12 +58,8 @@ class LeafPlateDetectionApp:
                 tkfont.nametofont(name).configure(family=self.FONT_FAMILY)
             except tk.TclError:
                 pass
-
-        # helpers สำหรับ CTk และ tk
         self.F   = lambda size, bold=False: ctk.CTkFont(
-            family=self.FONT_FAMILY,
-            size=size,
-            weight=("bold" if bold else "normal")
+            family=self.FONT_FAMILY, size=size, weight=("bold" if bold else "normal")
         )
         self.FTK = lambda size, bold=False: (
             (self.FONT_FAMILY, size, "bold") if bold else (self.FONT_FAMILY, size)
@@ -85,12 +69,7 @@ class LeafPlateDetectionApp:
     # Data
     # -----------------------------
     def initialize_data(self):
-        self.shape_counts = {
-            "heart": 28,
-            "rectangle": 31,
-            "circle": 10,
-            "total": 81
-        }
+        self.shape_counts = {"heart": 28, "rectangle": 31, "circle": 10, "total": 81}
         self.defect_data = [
             ("รอยแตก", "ผ่าน", "green"),
             ("รอยยุบหรือรอยพับ", "พบตำหนิ", "red"),
@@ -99,12 +78,19 @@ class LeafPlateDetectionApp:
             ("รอยขีดข่วนหรือรอยกลอก", "ผ่าน", "green")
         ]
         self.is_collecting_data = False
-        self.collected_data = {"leaf_plate_reports": {}}
-        self.collection_start_time = None
-        self.current_frame = None
         self.camera_running = False
         self.cap = None
-        # Mock data for export
+
+        # session & export
+        self.session_rows = []
+        self.session_meta = {}
+        self.collect_job_id = None
+        self.collect_interval_ms = 1000  # ความถี่การเพิ่มแถว (ms) — ปรับได้
+        self.plate_id_counter = 1
+        self.last_log_time = None  # ไม่ใช้เร่งเวลาแล้ว แต่เก็บล่าสุดเผื่อโชว์
+        self.lot_id = self.generate_lot_id()
+
+        # mock เดิม (คงไว้)
         self.mock_json_data = {
             "leaf_plate_reports": {
                 "session_1": {
@@ -118,12 +104,65 @@ class LeafPlateDetectionApp:
         }
 
     # -----------------------------
+    # Helpers for date/lot/defects
+    # -----------------------------
+    def generate_lot_id(self):
+        return "PTP" + datetime.now().strftime("%y%m%d") + "_01"
+
+    def thai_date(self, dt: datetime):
+        return dt.strftime(f"%d/%m/{dt.year + 543}")
+
+    def title_date(self, dt: datetime):
+        return dt.strftime("%d/%m/%y")
+
+    def random_defects_for_cell(self):
+        """ใช้ bullet '• ' เพื่อไม่ให้ Excel คิดว่าเป็นสูตร (#NAME?)"""
+        candidates = [
+            "รอยย่นหรือรอยพับ",
+            "จุดใหญ่หรือสีคล้ำ",
+            "จุดไหม้",
+            "รอยแตก",
+            "รูพรุนหรือรูเข็บ"
+        ]
+        if random.random() < 0.5:
+            return "-"   # ไม่มีตำหนิ
+        k = 1 if random.random() < 0.7 else 2
+        picked = random.sample(candidates, k=k)
+        return "\n".join([f"• {p}" for p in picked])
+
+    # ป้องกัน Excel ตีความเป็นสูตร + แทนบรรทัดใหม่เป็น \r\n
+    def _excel_safe(self, s: str) -> str:
+        if s is None:
+            return ""
+        s = str(s).replace("\n", "\r\n")
+        if s and s[0] in ("=", "+", "-", "@"):
+            s = "'" + s
+        return s
+
+    def next_mock_row(self):
+        """
+        ใช้เวลาจริงจากเครื่อง ณ ตอนสร้างแถว (ไม่เร่งเวลา)
+        """
+        now = datetime.now()
+        self.last_log_time = now  # เก็บไว้เป็นข้อมูลล่าสุด
+        row = {
+            "date": self.thai_date(now),
+            "time": now.strftime("%H:%M:%S"),
+            "plate_id": self.plate_id_counter,
+            "lot_id": self.lot_id,
+            "defects": self.random_defects_for_cell(),
+            "note": ""
+        }
+        self.plate_id_counter += 1
+        return row
+
+    # -----------------------------
     # App / Camera
     # -----------------------------
     def setup_app(self):
         self.set_layout_constants()
         ctk.set_appearance_mode("light")
-        ctk.set_default_color_theme("blue")  # base theme
+        ctk.set_default_color_theme("blue")
         self.app = ctk.CTk()
         self.app.title("Leaf Plate Defect Detection - Full HD")
         self.app.geometry(f"{self.W}x{self.H}+0+0")
@@ -132,21 +171,17 @@ class LeafPlateDetectionApp:
         self.app.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def setup_camera(self):
-        # เลือก backend ตามระบบปฏิบัติการ
         if sys.platform.startswith("win"):
             backend = cv2.CAP_DSHOW
         elif sys.platform == "darwin":
             backend = cv2.CAP_AVFOUNDATION
         else:
             backend = cv2.CAP_V4L2
-
         self.cap = cv2.VideoCapture(0, backend)
         if not self.cap or not self.cap.isOpened():
             self.cap = cv2.VideoCapture(0)
         if not self.cap or not self.cap.isOpened():
             print("Cannot open camera"); self.cap = None; return
-
-        # กล้องกว้างขึ้นเพื่อคุณภาพภาพ
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
@@ -194,7 +229,6 @@ class LeafPlateDetectionApp:
         self.create_right_panel()
         self.create_bottom_panel()
 
-    # Left panel — bigger camera
     def create_left_panel(self):
         left_frame = ctk.CTkFrame(
             self.app, width=self.left_w, height=self.TOP_H,
@@ -239,7 +273,6 @@ class LeafPlateDetectionApp:
         )
         export_button.place(x=button_frame_w - 150, y=5)
 
-    # Right panel
     def create_right_panel(self):
         right_x = self.M + self.left_w + self.GAP
         right_frame = ctk.CTkFrame(
@@ -263,7 +296,7 @@ class LeafPlateDetectionApp:
         total_card.place(x=20, y=20)
 
         ctk.CTkLabel(
-            total_card, text="Total Plates Counted",
+            total_card, text="นับได้ทั้งหมด",
             font=self.F(18, True), text_color="#1a2a3a"
         ).place(x=card_w // 2, y=24, anchor="center")
 
@@ -291,7 +324,6 @@ class LeafPlateDetectionApp:
         gap = max(12, (card_w - 3 * box_w) // 4)
         y0 = 55
 
-        # Heart
         heart_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
         heart_frame.place(x=gap, y=y0)
         ctk.CTkLabel(heart_frame, text="Heart", font=self.F(14, True), text_color="#e74c3c")\
@@ -299,7 +331,6 @@ class LeafPlateDetectionApp:
         ctk.CTkLabel(heart_frame, text=str(self.shape_counts["heart"]), font=self.F(22, True),
                      text_color="#1a2a3a").place(x=box_w // 2, y=70, anchor="center")
 
-        # Rectangle
         rect_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
         rect_frame.place(x=gap * 2 + box_w, y=y0)
         ctk.CTkLabel(rect_frame, text="Rectangle", font=self.F(14, True), text_color="#3498db")\
@@ -307,7 +338,6 @@ class LeafPlateDetectionApp:
         ctk.CTkLabel(rect_frame, text=str(self.shape_counts["rectangle"]), font=self.F(22, True),
                      text_color="#1a2a3a").place(x=box_w // 2, y=70, anchor="center")
 
-        # Circle (ตามโค้ดหลักเดิม)
         circle_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
         circle_frame.place(x=gap * 3 + box_w * 2, y=y0)
         ctk.CTkLabel(circle_frame, text="Circle", font=self.F(14, True), text_color="#199129")\
@@ -329,18 +359,18 @@ class LeafPlateDetectionApp:
             font=self.F(18, True), text_color="#1a2a3a"
         ).place(x=card_w // 2, y=18, anchor="center")
 
-        ctk.CTkLabel(session_card, text="Defects Found: 19 plates",
+        ctk.CTkLabel(session_card, text="พบตำหนิ: 19 จาน",
                      font=self.F(16, True), text_color="#e74c3c").place(x=40, y=50)
 
-        ctk.CTkLabel(session_card, text="Current Plate ID: 81",
+        ctk.CTkLabel(session_card, text="จานที่ : 81",
                      font=self.F(15), text_color="#1a2a3a").place(x=40, y=78)
 
         lot_date = datetime.now().strftime("%d%m%Y")
-        ctk.CTkLabel(session_card, text=f"Lot ID: PTP{lot_date}_01",
+        ctk.CTkLabel(session_card, text=f"รหัสล็อต : PTP{lot_date}_01",
                      font=self.F(15), text_color="#1a2a3a").place(x=40, y=104)
 
-    # Bottom panel (compact, bigger fonts)
-    def create_bottom_panel(self):
+    # Bottom
+    def create_bottom_panel(self,):
         bottom_frame = ctk.CTkFrame(
             self.app, width=self.bottom_w, height=self.BOTTOM_H,
             fg_color="#ffffff", corner_radius=15,
@@ -369,7 +399,7 @@ class LeafPlateDetectionApp:
                      text_color="white").place(x=col2_x, y=22, anchor="center")
 
         row_start_y = 55
-        row_h = 36  # readable but compact
+        row_h = 36
         for i, (defect, status, color) in enumerate(self.defect_data):
             row_y = row_start_y + i * row_h
             row_color = "#ffffff" if i % 2 == 0 else "#e0f2f7"
@@ -379,77 +409,58 @@ class LeafPlateDetectionApp:
 
             ctk.CTkLabel(row_frame, text=defect, font=self.F(15),
                          text_color="#1a2a3a").place(x=col1_x, y=row_h // 2, anchor="center")
-            
-            #สีสถานะผ่าน หรือ ไม่ผ่าน
+
             status_color = "#199129" if color == "green" else "#e74c3c"
             ctk.CTkLabel(row_frame, text=status, font=self.F(15, True),
                          text_color=status_color).place(x=col2_x, y=row_h // 2, anchor="center")
 
-    # ----------------- Export utils -----------------
-    def get_unique_filename(self, base_path, extension):
-        current_date = datetime.now().strftime("%d%m%Y")
-        counter = 1
-        while True:
-            filename = f"Report_{current_date}_{counter}{extension}"
-            full_path = os.path.join(base_path, filename)
-            if not os.path.exists(full_path):
-                return full_path
-            counter += 1
+    # ----------------- Export helpers (UTF-8 BOM + Excel Safe) -----------------
+    def _unique_filename(self, base_path, stem, extension):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"{stem}_{ts}{extension}"
+        full = os.path.join(base_path, fname)
+        i = 2
+        while os.path.exists(full):
+            fname = f"{stem}_{ts}_{i}{extension}"
+            full = os.path.join(base_path, fname)
+            i += 1
+        return full
 
-    def save_to_csv(self, dialog):
-        try:
-            save_directory = filedialog.askdirectory(title="Select Directory to Save CSV Report")
-            if save_directory:
-                filename = self.get_unique_filename(save_directory, ".csv")
-                with open(filename, 'w', newline='', encoding='utf-8') as file:
-                    writer = csv.writer(file)
-                    writer.writerow(["Plate ID", "Time", "Defects", "Shape"])
-                    plates = self.mock_json_data["leaf_plate_reports"][list(self.mock_json_data["leaf_plate_reports"].keys())[0]]["plates"]
-                    for plate_id, p in plates.items():
-                        writer.writerow([plate_id, p["time"], ", ".join(p["defects"]), p["shape"]])
-                messagebox.showinfo("Success", f"CSV file saved successfully!\n{os.path.basename(filename)}")
-                dialog.destroy()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save CSV file:\n{str(e)}")
+    def _write_csv(self, directory) -> str:
+        csv_path = self._unique_filename(directory, "Report", ".csv")
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([self._excel_safe(f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}")])
+            w.writerow(["วันที่", "เวลา", "Plate ID", "Lot ID", "ตำหนิที่พบ", "หมายเหตุ"])
+            for r in self.session_rows:
+                defects_for_csv = self._excel_safe(r["defects"])
+                w.writerow([r["date"], r["time"], r["plate_id"], r["lot_id"], defects_for_csv, self._excel_safe(r["note"])])
+        return csv_path
 
-    def save_to_json(self, dialog):
-        try:
-            save_directory = filedialog.askdirectory(title="Select Directory to Save JSON Report")
-            if save_directory:
-                filename = self.get_unique_filename(save_directory, ".json")
-                with open(filename, 'w', encoding='utf-8') as file:
-                    json.dump(self.mock_json_data, file, ensure_ascii=False, indent=2)
-                messagebox.showinfo("Success", f"JSON file saved successfully!\n{os.path.basename(filename)}")
-                dialog.destroy()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save JSON file:\n{str(e)}")
+    def _write_json(self, directory) -> str:
+        json_path = self._unique_filename(directory, "Report", ".json")
+        payload = {
+            "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}",
+            "lot_id": self.lot_id,
+            "session": {
+                "start_time": self.session_meta.get("start_time"),
+                "end_time": datetime.now().strftime("%H:%M:%S")
+            },
+            "records": self.session_rows
+        }
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(payload, jf, ensure_ascii=False, indent=2)
+        return json_path
 
-    def save_collected_to_csv_and_json(self, dialog):
-        try:
-            save_directory = filedialog.askdirectory(title="Select Directory to Save Both Files")
-            if save_directory:
-                # CSV
-                csv_filename = self.get_unique_filename(save_directory, ".csv")
-                with open(csv_filename, 'w', newline='', encoding='utf-8') as file:
-                    writer = csv.writer(file)
-                    writer.writerow(["Plate ID", "Time", "Defects", "Shape"])
-                    plates = self.mock_json_data["leaf_plate_reports"][list(self.mock_json_data["leaf_plate_reports"].keys())[0]]["plates"]
-                    for plate_id, p in plates.items():
-                        writer.writerow([plate_id, p["time"], ", ".join(p["defects"]), p["shape"]])
-                # JSON
-                json_filename = self.get_unique_filename(save_directory, ".json")
-                with open(json_filename, 'w', encoding='utf-8') as file:
-                    json.dump(self.mock_json_data, file, ensure_ascii=False, indent=2)
-                messagebox.showinfo(
-                    "Success",
-                    f"CSV and JSON files saved successfully!\n"
-                    f"{os.path.basename(csv_filename)}\n"
-                    f"{os.path.basename(json_filename)}"
-                )
-                dialog.destroy()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save files:\n{str(e)}")
+    def export_session_csv_and_json(self, directory):
+        if not self.session_rows:
+            messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
+            return
+        csv_path = self._write_csv(directory)
+        json_path = self._write_json(directory)
+        messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}\n{os.path.basename(json_path)}")
 
+    # ---------- Export dialog ----------
     def show_export_dialog(self):
         dialog = ctk.CTkToplevel(self.app)
         dialog.title("Export Options")
@@ -459,15 +470,58 @@ class LeafPlateDetectionApp:
 
         ctk.CTkLabel(dialog, text="Choose Export Format", font=self.F(16, True))\
             .place(x=160, y=30, anchor="center")
-        ctk.CTkButton(dialog, width=220, height=38, text="Export to CSV", font=self.F(12, True),
-                      text_color="#FFFFFF", fg_color="#50C878", hover_color="#27ad60",
-                      command=lambda: self.save_to_csv(dialog)).place(x=160, y=80, anchor="center")
-        ctk.CTkButton(dialog, width=220, height=38, text="Export to JSON", font=self.F(12, True),
-                      text_color="#FFFFFF", fg_color="#f1c40f", hover_color="#d4ac0d",
-                      command=lambda: self.save_to_json(dialog)).place(x=160, y=125, anchor="center")
-        ctk.CTkButton(dialog, width=220, height=38, text="Export Both", font=self.F(12, True),
-                      text_color="#FFFFFF", fg_color="#3498db", hover_color="#2980b9",
-                      command=lambda: self.save_collected_to_csv_and_json(dialog)).place(x=160, y=170, anchor="center")
+
+        ctk.CTkButton(
+            dialog, width=220, height=38, text="Export to CSV", font=self.F(12, True),
+            text_color="#FFFFFF", fg_color="#50C878", hover_color="#27ad60",
+            command=lambda: self.save_to_csv(dialog)
+        ).place(x=160, y=80, anchor="center")
+
+        ctk.CTkButton(
+            dialog, width=220, height=38, text="Export to JSON", font=self.F(12, True),
+            text_color="#FFFFFF", fg_color="#f1c40f", hover_color="#d4ac0d",
+            command=lambda: self.save_to_json(dialog)
+        ).place(x=160, y=125, anchor="center")
+
+        ctk.CTkButton(
+            dialog, width=220, height=38, text="Export Both", font=self.F(12, True),
+            text_color="#FFFFFF", fg_color="#3498db", hover_color="#2980b9",
+            command=lambda: self.save_collected_to_csv_and_json(dialog)
+        ).place(x=160, y=170, anchor="center")
+
+    def save_to_csv(self, dialog):
+        if not self.session_rows:
+            messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
+            return
+        directory = filedialog.askdirectory(title="เลือกโฟลเดอร์สำหรับบันทึก CSV")
+        if directory:
+            csv_path = self._write_csv(directory)
+            messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}")
+            dialog.destroy()
+
+    def save_to_json(self, dialog):
+        if not self.session_rows:
+            messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
+            return
+        directory = filedialog.askdirectory(title="เลือกโฟลเดอร์สำหรับบันทึก JSON")
+        if directory:
+            json_path = self._write_json(directory)
+            messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(json_path)}")
+            dialog.destroy()
+
+    def save_collected_to_csv_and_json(self, dialog):
+        if not self.session_rows:
+            messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
+            return
+        directory = filedialog.askdirectory(title="เลือกโฟลเดอร์สำหรับบันทึกไฟล์รายงาน")
+        if directory:
+            csv_path = self._write_csv(directory)
+            json_path = self._write_json(directory)
+            messagebox.showinfo(
+                "Success",
+                f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}\n{os.path.basename(json_path)}"
+            )
+            dialog.destroy()
 
     # ----------------- Camera update -----------------
     def start_camera(self):
@@ -489,9 +543,8 @@ class LeafPlateDetectionApp:
             return
         try:
             frame_resized = cv2.resize(frame, (self.cam_w, self.cam_h))
-            # detection box (ตัวอย่าง)
             cv2.rectangle(frame_resized, (20, 20),
-                          (frame_resized.shape[1]-20, frame_resized.shape[0]-20),
+                          (frame_resized.shape[1]-20, self.cam_h-20),
                           (0, 255, 0), 2)
             frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(frame_rgb)
@@ -502,17 +555,42 @@ class LeafPlateDetectionApp:
             print(f"Camera error: {e}")
         self.app.after(30, self.update_camera)
 
+    # ----------------- Data collection loop -----------------
+    def start_collect_loop(self):
+        if not self.session_meta:
+            self.session_meta = {
+                "start_time": datetime.now().strftime("%H:%M:%S"),
+                "lot_id": self.lot_id
+            }
+        self.session_rows.append(self.next_mock_row())
+        self.collect_job_id = self.app.after(self.collect_interval_ms, self.start_collect_loop)
+
+    def cancel_collect_loop(self):
+        if self.collect_job_id is not None:
+            try:
+                self.app.after_cancel(self.collect_job_id)
+            except Exception:
+                pass
+            self.collect_job_id = None
+
     # ----------------- Events -----------------
     def toggle_data_collection(self):
-        self.is_collecting_data = not self.is_collecting_data
-        if self.is_collecting_data:
+        if not self.is_collecting_data:
+            self.is_collecting_data = True
             self.toggle_button.configure(text="หยุด", fg_color="#e74c3c", hover_color="#c0392b")
+            # ถ้าอยากเริ่ม session ใหม่ทุกครั้ง:
+            # self.session_rows = []; self.plate_id_counter, self.last_log_time = 1, None
+            self.start_collect_loop()
         else:
-            self.toggle_button.configure(text="เริ่ม", fg_color="#3498db", hover_color="#2980b9")
-
-    def update_header_time(self):
-        self.header_time_label.configure(text=datetime.now().strftime("%H:%M:%S"))
-        self.app.after(1000, self.update_header_time)
+            if messagebox.askyesno("ยืนยันการหยุด", "ท่านต้องการหยุดและบันทึกไฟล์หรือไม่?"):
+                self.is_collecting_data = False
+                self.toggle_button.configure(text="เริ่ม", fg_color="#3498db", hover_color="#2980b9")
+                self.cancel_collect_loop()
+                directory = filedialog.askdirectory(title="เลือกโฟลเดอร์สำหรับบันทึกไฟล์รายงาน")
+                if directory:
+                    self.export_session_csv_and_json(directory)
+            else:
+                return
 
     def create_mock_data(self):
         self.mock_data = {
@@ -521,7 +599,15 @@ class LeafPlateDetectionApp:
             "defects_found": 19
         }
 
+    def update_header_time(self):
+        self.header_time_label.configure(text=datetime.now().strftime("%H:%M:%S"))
+        self.app.after(1000, self.update_header_time)
+
     def on_closing(self):
+        if self.is_collecting_data:
+            if not messagebox.askyesno("ออกจากโปรแกรม", "กำลังบันทึกข้อมูลอยู่ ต้องการออกทันทีหรือไม่?"):
+                return
+        self.cancel_collect_loop()
         self.stop_camera()
         self.app.destroy()
 
