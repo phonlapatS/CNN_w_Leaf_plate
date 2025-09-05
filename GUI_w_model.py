@@ -1,39 +1,38 @@
 # GUI.py
+# -*- coding: utf-8 -*-
+# ต้องมีไฟล์ service account ชื่อ firebase_private.json วางข้างไฟล์นี้
+# ติดตั้งที่ต้องใช้: pip install customtkinter ultralytics opencv-python pillow firebase-admin
+
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox  # เมนู Export ยังใช้ได้
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
-
 from ultralytics import YOLO
 
 from datetime import datetime
-import os, sys, json, csv, time, random
+import os, sys, json, csv, time
+import urllib.request, urllib.error  # fallback REST ถ้า Admin SDK init ไม่สำเร็จ
+import uuid
+from datetime import datetime, timezone
+
+# -------- Firebase Admin SDK --------
+import firebase_admin
+from firebase_admin import credentials, db
 
 
 class LeafPlateDetectionApp:
     """
     Leaf Plate Defect Detection Application
-    Full HD (1920x1080) layout; bigger camera; shorter Current Session card;
-    table with larger fonts but compact height. Default font = Arial (forced).
-
-    โหมดจริง: กด "เริ่ม" เพื่อให้ YOLO ตรวจจับจากกล้อง
-    - จะ "บันทึกรูป + เพิ่มรายการ" เฉพาะเมื่อ "เจอจานหรือเจอตำหนิ"
-    - รูป Annotated เก็บที่โฟลเดอร์ ./captures
-    - Export CSV/JSON ได้จากปุ่ม Export
+    - โหลดโมเดล best.pt ข้างไฟล์
+    - ถ้าตรวจเจอ => เซฟภาพ + append CSV + update JSON ใน ./savefile/
+      และ push แถวล่าสุดขึ้น Firebase ทันที
+    - ปุ่ม "หยุด" มีป๊อปอัปยืนยัน: Submit (ยืนยัน) / ตรวจต่อ
+    - เมนู Export เดิมยังอยู่เหมือนเดิม
     """
-
-    def __init__(self):
-        self.initialize_data()
-        self.setup_app()
-        self.setup_fonts()
-        self.setup_camera()
-        self.setup_model()          # โหลดโมเดล YOLO
-        self.create_widgets()
-        self.start_camera()
 
     # -----------------------------
     # Layout constants for Full HD
@@ -77,10 +76,9 @@ class LeafPlateDetectionApp:
         )
 
     # -----------------------------
-    # Data / Config (no mock)
+    # Data / Config
     # -----------------------------
     def initialize_data(self):
-        # ตัวนับจำนวนจานตามรูปทรง (นับเมื่อพบในเฟรมที่บันทึก)
         self.shape_counts = {"heart": 0, "rectangle": 0, "circle": 0, "total": 0}
 
         # ตารางสถานะด้านล่าง (ค่าเริ่มต้น)
@@ -91,10 +89,10 @@ class LeafPlateDetectionApp:
             ("รอยยับ/พับ", "ยังไม่ใช้", "green"),
             ("รอยขีดข่วน", "ยังไม่ใช้", "green")
         ]
-        self.status_labels = {}   # เก็บ label ของคอลัมน์สถานะเพื่ออัปเดตแบบ real-time
-        self.defect_th_map = {"crack": "รอยแตก", "hole": "รูพรุนหรือรูเข็บ"}
+        self.status_labels = {}
+        # >>> ปรับคำแปล defect EN -> TH ตามที่ขอ <<<
+        self.defect_th_map = {"crack": "รอยแตก", "hole": "รูเข็ม"}
 
-        # สถานะ/ทรัพยากร
         self.is_collecting_data = False
         self.camera_running = False
         self.cap = None
@@ -105,9 +103,13 @@ class LeafPlateDetectionApp:
         self.plate_id_counter = 1
         self.lot_id = self.generate_lot_id()
 
+        # Path พื้นฐานและโฟลเดอร์บันทึก
+        self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        self.save_root = os.path.join(self.BASE_DIR, "savefile")
+        os.makedirs(self.save_root, exist_ok=True)
+
         # ---------- YOLO / Detection ----------
-        # !!! แก้ path นี้ให้ตรงกับ best.pt ของคุณ !!!
-        self.MODEL_PATH = r"runs\finetune_leaf_v11s_20250830_0211_img896_e8022\weights\best.pt"
+        self.MODEL_PATH = os.path.join(self.BASE_DIR, "best.pt")
         self.model = None
         self.imgsz = 896
         self.conf_thr = 0.27
@@ -122,13 +124,23 @@ class LeafPlateDetectionApp:
             "circle_leaf_plate": "circle",
         }
 
-        # การบันทึก
-        self.save_dir = os.path.join(os.getcwd(), "captures")
-        os.makedirs(self.save_dir, exist_ok=True)
-        self.save_cooldown_ms = 1200   # กันบันทึกรัว ๆ
+        # โฟลเดอร์รูป Annotated
+        self.captures_dir = os.path.join(self.BASE_DIR, "captures")
+        os.makedirs(self.captures_dir, exist_ok=True)
+        self.save_cooldown_ms = 1200
         self._last_save_ms = 0
 
-        # label ตัวเลขรูปทรง (กำหนดตอนสร้าง UI)
+        # ไฟล์ CSV/JSON อัตโนมัติของ "รอบนี้"
+        self._auto_csv_path = None
+        self._auto_json_path = None
+        self._session_stamp = None
+
+        # ---------- Firebase ----------
+        self.firebase_base = "https://leaf-plate-defect-detec-w-cnn-default-rtdb.asia-southeast1.firebasedatabase.app"
+        self.firebase_session_key = None
+        self._fb_ready = False  # Admin SDK พร้อมหรือยัง
+
+        # label บนการ์ดนับรูปทรง
         self.lbl_heart = None
         self.lbl_rect  = None
         self.lbl_circle= None
@@ -144,6 +156,73 @@ class LeafPlateDetectionApp:
 
     def title_date(self, dt: datetime):
         return dt.strftime("%d/%m/%y")
+
+    # -----------------------------
+    # Firebase Admin helpers
+    # -----------------------------
+    def _fb_init(self):
+        """Init Firebase Admin ด้วย service account 'serviceAccountKey.json' หนึ่งครั้ง"""
+        if self._fb_ready:
+            return
+        try:
+            cred_path = os.path.join(self.BASE_DIR, "serviceAccountKey.json")  # เปลี่ยนชื่อไฟล์
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred, {"databaseURL": self.firebase_base})
+            self._fb_ready = True
+        except Exception as e:
+            print(f"[Firebase] Admin init failed, fallback to REST. reason={e}")
+            self._fb_ready = False
+
+    def _firebase_post(self, path, obj):
+        """POST (push) : Admin SDK ก่อน, ไม่งั้น fallback REST"""
+        # เพิ่ม meta เหมือน mock_data.py
+        payload = {
+            **obj,
+            "_meta": {
+                "source": "python-admin",
+                "pushed_at": datetime.now(timezone.utc).isoformat(),
+                "server_id": str(uuid.uuid4())
+            }
+        }
+        try:
+            self._fb_init()
+            if self._fb_ready:
+                ref = db.reference(path)
+                ref.push(payload)
+                return
+        except Exception as e:
+            print(f"[Firebase] Admin push failed, fallback to REST. reason={e}")
+
+        # --- Fallback: REST ---
+        try:
+            url = f"{self.firebase_base}/{path}.json"
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except Exception as e:
+            print(f"[Firebase] REST POST error: {e}")
+
+    def _firebase_put(self, path, obj):
+        """PUT (set) : Admin SDK ก่อน, ไม่งั้น fallback REST"""
+        try:
+            self._fb_init()
+            if self._fb_ready:
+                ref = db.reference(path)
+                ref.set(obj)
+                return
+        except Exception as e:
+            print(f"[Firebase] Admin set failed, fallback to REST. reason={e}")
+
+        # --- Fallback: REST ---
+        try:
+            url = f"{self.firebase_base}/{path}.json"
+            data = json.dumps(obj).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="PUT")
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except Exception as e:
+            print(f"[Firebase] REST PUT error: {e}")
 
     # -----------------------------
     # App / Camera / Model
@@ -363,7 +442,6 @@ class LeafPlateDetectionApp:
             font=self.F(18, True), text_color="#1a2a3a"
         ).place(x=card_w // 2, y=18, anchor="center")
 
-        # ข้อความตัวอย่าง (ไม่บังคับเชื่อมค่าจริง)
         ctk.CTkLabel(session_card, text="พบตำหนิ: กดเริ่มเพื่อตรวจจับ",
                      font=self.F(16), text_color="#e74c3c").place(x=40, y=50)
 
@@ -420,7 +498,6 @@ class LeafPlateDetectionApp:
                                text_color=status_color)
             lbl.place(x=col2_x, y=row_h // 2, anchor="center")
 
-            # จด label เพื่อง่ายต่อการอัปเดตภายหลัง
             self.status_labels[defect] = lbl
 
     # ----------------- Export helpers (UTF-8 BOM + Excel Safe) -----------------
@@ -443,15 +520,19 @@ class LeafPlateDetectionApp:
             i += 1
         return full
 
+    # >>> ปรับหัวตารางและข้อมูลให้มีคอลัมน์ "รูปทรงจาน" <<<
     def _write_csv(self, directory) -> str:
         csv_path = self._unique_filename(directory, "Report", ".csv")
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow([self._excel_safe(f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}")])
-            w.writerow(["วันที่", "เวลา", "Plate ID", "Lot ID", "ตำหนิที่พบ", "หมายเหตุ"])
+            w.writerow(["วันที่", "เวลา", "Plate ID", "Lot ID", "รูปทรงจาน", "ตำหนิที่พบ", "หมายเหตุ"])
             for r in self.session_rows:
                 defects_for_csv = self._excel_safe(r["defects"])
-                w.writerow([r["date"], r["time"], r["plate_id"], r["lot_id"], defects_for_csv, self._excel_safe(r["note"])])
+                w.writerow([
+                    r["date"], r["time"], r["plate_id"], r["lot_id"],
+                    r.get("shape", "-"), defects_for_csv, self._excel_safe(r["note"])
+                ])
         return csv_path
 
     def _write_json(self, directory) -> str:
@@ -469,6 +550,7 @@ class LeafPlateDetectionApp:
             json.dump(payload, jf, ensure_ascii=False, indent=2)
         return json_path
 
+    # ---------- (คงเมนู Export เดิม) ----------
     def export_session_csv_and_json(self, directory):
         if not self.session_rows:
             messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
@@ -477,7 +559,6 @@ class LeafPlateDetectionApp:
         json_path = self._write_json(directory)
         messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}\n{os.path.basename(json_path)}")
 
-    # ---------- Export dialog ----------
     def show_export_dialog(self):
         dialog = ctk.CTkToplevel(self.app)
         dialog.title("Export Options")
@@ -540,6 +621,76 @@ class LeafPlateDetectionApp:
             )
             dialog.destroy()
 
+    # ----------------- Auto-save (CSV/JSON in ./savefile) + Firebase -----------------
+    def _ensure_session_files(self):
+        """สร้างไฟล์ CSV/JSON ของ 'รอบนี้' เมื่อมีรายการแรก"""
+        if self._auto_csv_path and self._auto_json_path:
+            return
+        self._session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._auto_csv_path  = os.path.join(self.save_root, f"Report_{self._session_stamp}.csv")
+        self._auto_json_path = os.path.join(self.save_root, f"Report_{self._session_stamp}.json")
+
+        with open(self._auto_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([self._excel_safe(f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}")])
+            # >>> เพิ่มหัวคอลัมน์ "รูปทรงจาน" <<<
+            w.writerow(["วันที่", "เวลา", "Plate ID", "Lot ID", "รูปทรงจาน", "ตำหนิที่พบ", "หมายเหตุ"])
+
+        self.session_meta.setdefault("start_time", datetime.now().strftime("%H:%M:%S"))
+
+        self.firebase_session_key = self._session_stamp  # ใช้ stamp เป็นชื่อ session
+
+        self._write_json_to_path(self._auto_json_path)
+
+    def _append_csv_row_to_path(self, row):
+        with open(self._auto_csv_path, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            defects_for_csv = self._excel_safe(row["defects"])
+            w.writerow([
+                row["date"], row["time"], row["plate_id"], row["lot_id"],
+                row.get("shape", "-"), defects_for_csv, self._excel_safe(row["note"])
+            ])
+
+    def _write_json_to_path(self, path):
+        payload = {
+            "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}",
+            "lot_id": self.lot_id,
+            "session": {
+                "start_time": self.session_meta.get("start_time"),
+                "end_time": datetime.now().strftime("%H:%M:%S")
+            },
+            "records": self.session_rows
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as jf:
+                json.dump(payload, jf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Write JSON error: {e}")
+
+    def _append_csv_json_and_firebase(self, row):
+        """เรียกทุกครั้งที่เจอ => append CSV, update JSON, ส่ง Firebase"""
+        self._ensure_session_files()
+
+        # append CSV
+        self._append_csv_row_to_path(row)
+
+        # update JSON (เขียนใหม่ทั้งไฟล์จาก self.session_rows)
+        self._write_json_to_path(self._auto_json_path)
+
+        # อัปเดต meta session (PUT)
+        meta = {
+            "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}",
+            "lot_id": self.lot_id,
+            "session": {
+                "start_time": self.session_meta.get("start_time"),
+                "end_time": datetime.now().strftime("%H:%M:%S")
+            }
+        }
+        self._firebase_put(f"sessions/{self.firebase_session_key}/meta", meta)
+
+        # โพสต์แถวล่าสุดเข้า Firebase (POST)
+        self._firebase_post(f"sessions/{self.firebase_session_key}/records", row)
+
     # ----------------- Detection helpers -----------------
     def _update_shape_counters(self, shapes_found: set):
         if not shapes_found:
@@ -555,7 +706,6 @@ class LeafPlateDetectionApp:
         self.total_number_label.configure(text=str(self.shape_counts["total"]))
 
     def _update_defect_status_ui(self, defect_names: set):
-        """อัปเดตข้อความในตารางด้านล่างเมื่อพบ defect (เฉพาะ crack/hole)"""
         for en_name in defect_names:
             th_name = self.defect_th_map.get(en_name)
             if not th_name:
@@ -565,42 +715,40 @@ class LeafPlateDetectionApp:
                 lbl.configure(text="พบตำหนิ", text_color="#e74c3c")
 
     def _save_detection_record(self, annotated_bgr, defect_names: set, shapes_found: set):
-        # เวลาปัจจุบัน
         now = datetime.now()
         ts  = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
         # บันทึกรูป
-        img_path = os.path.join(self.save_dir, f"detect_{ts}.jpg")
+        img_path = os.path.join(self.captures_dir, f"detect_{ts}.jpg")
         try:
             cv2.imwrite(img_path, annotated_bgr)
         except Exception as e:
             print(f"Save image error: {e}")
 
-        # บันทึกแถวลง session
-        if defect_names:
-            defects_text = "\r\n".join([f"• {d}" for d in sorted(defect_names)])
-        else:
-            defects_text = "-"
+        # แปลง defect EN->TH และเอาเครื่องหมาย • ออก
+        defects_th = [self.defect_th_map.get(d, d) for d in sorted(defect_names)]
+        defects_text = " - " if not defects_th else " / ".join(defects_th)
 
+        # สรุปรูปทรง (กรณีพบหลายรูปทรง ให้รวมด้วย '/')
+        shape_text = "-" if not shapes_found else " / ".join(sorted(shapes_found))
+
+        # สร้างแถวข้อมูล (เพิ่มคีย์ shape)
         row = {
             "date": self.thai_date(now),
             "time": now.strftime("%H:%M:%S"),
             "plate_id": self.plate_id_counter,
             "lot_id": self.lot_id,
-            "defects": defects_text,
+            "shape": shape_text,
+            "defects": defects_text.strip(),
             "note": ""
         }
         self.plate_id_counter += 1
         self.session_rows.append(row)
 
-        # อัปเดตการ์ดสถานะ
         self._update_defect_status_ui(defect_names)
+        return row
 
     def _annotate_and_summarize(self, frame_bgr, res):
-        """
-        วาดกรอบ + สรุปว่าพบ plate/defect อะไรบ้าง
-        return: annotated_bgr, shapes_found(set), defect_names(set)
-        """
         annotated = frame_bgr.copy()
         shapes_found, defect_names = set(), set()
 
@@ -616,12 +764,10 @@ class LeafPlateDetectionApp:
 
         for (x1, y1, x2, y2), c, p in zip(xyxy, clss, conf):
             label = names.get(int(c), str(c))
-            # วาดกรอบ/ป้าย
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 0), 2)
             cv2.putText(annotated, f"{label} {p:.2f}", (x1, max(20, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 255), 2, cv2.LINE_AA)
 
-            # เก็บชนิดที่พบ
             if label in self.shape_classes:
                 shapes_found.add(self.shape_map[label])
             if label in self.defect_classes:
@@ -650,7 +796,6 @@ class LeafPlateDetectionApp:
 
         frame_resized = cv2.resize(frame, (self.cam_w, self.cam_h))
 
-        # โหมดตรวจจับจริง (กดเริ่มแล้ว)
         if self.is_collecting_data and self.model is not None:
             try:
                 results = self.model.predict(
@@ -664,12 +809,13 @@ class LeafPlateDetectionApp:
                 annotated, shapes_found, defect_names = self._annotate_and_summarize(frame_resized, res)
                 frame_to_show = annotated
 
-                # ถ้าเจอจานหรือเจอตำหนิ -> บันทึก (Cooldown 1.2s)
                 if (shapes_found or defect_names):
                     now_ms = time.time() * 1000.0
                     if now_ms - self._last_save_ms >= self.save_cooldown_ms:
                         self._update_shape_counters(shapes_found)
-                        self._save_detection_record(annotated, defect_names, shapes_found)
+                        row = self._save_detection_record(annotated, defect_names, shapes_found)
+                        # เซฟ CSV/JSON อัตโนมัติ + ส่ง Firebase
+                        self._append_csv_json_and_firebase(row)
                         self._last_save_ms = now_ms
             except Exception as e:
                 print(f"Inference error: {e}")
@@ -677,7 +823,6 @@ class LeafPlateDetectionApp:
         else:
             frame_to_show = frame_resized
 
-        # แสดงผลบนกล้องใน UI
         try:
             frame_rgb = cv2.cvtColor(frame_to_show, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(frame_rgb)
@@ -689,6 +834,79 @@ class LeafPlateDetectionApp:
 
         self.app.after(30, self.update_camera)
 
+    # ----------------- Stop confirm popup -----------------
+    def stop_and_finalize(self):
+        """หยุดการตรวจ + export อัตโนมัติลง ./savefile/ + อัปเดต meta ไป Firebase"""
+        self.is_collecting_data = False
+        try:
+            self.toggle_button.configure(text="เริ่ม", fg_color="#3498db", hover_color="#2980b9")
+        except Exception:
+            pass
+
+        if self.session_rows:
+            try:
+                self._write_csv(self.save_root)
+                self._write_json(self.save_root)
+            except Exception as e:
+                print(f"[Export at stop] failed: {e}")
+
+        if self._session_stamp:
+            meta = {
+                "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}",
+                "lot_id": self.lot_id,
+                "session": {
+                    "start_time": self.session_meta.get("start_time"),
+                    "end_time": datetime.now().strftime("%H:%M:%S")
+                }
+            }
+            self._firebase_put(f"sessions/{self.firebase_session_key}/meta", meta)
+
+    def show_stop_confirm_dialog(self):
+        """แสดงป๊อปอัปยืนยันการหยุด: Submit (ยืนยัน) / ตรวจต่อ"""
+        dlg = ctk.CTkToplevel(self.app)
+        dlg.title("ยืนยันการหยุด")
+        dlg.geometry("380x190")
+        dlg.resizable(False, False)
+        dlg.transient(self.app)
+        dlg.grab_set()
+
+        # จัดกลางหน้าจอหลัก
+        try:
+            self.app.update_idletasks()
+            ax, ay = self.app.winfo_x(), self.app.winfo_y()
+            aw, ah = self.app.winfo_width(), self.app.winfo_height()
+            dw, dh = 380, 190
+            dlg.geometry(f"{dw}x{dh}+{ax + (aw-dw)//2}+{ay + (ah-dh)//2}")
+        except Exception:
+            pass
+
+        ctk.CTkLabel(dlg,
+            text="คุณยืนยันจะหยุดตรวจและบันทึกรายงานหรือไม่?",
+            font=self.F(16, True)
+        ).place(x=190, y=55, anchor="center")
+
+        ctk.CTkButton(
+            dlg, width=140, height=40, text="Submit (ยืนยัน)",
+            font=self.F(14, True), fg_color="#27ae60", hover_color="#1e8449",
+            command=lambda: self._handle_stop_submit(dlg)
+        ).place(x=40, y=110)
+
+        ctk.CTkButton(
+            dlg, width=140, height=40, text="ตรวจต่อ",
+            font=self.F(14, True), fg_color="#95a5a6", hover_color="#7f8c8d",
+            command=dlg.destroy
+        ).place(x=200, y=110)
+
+        dlg.bind("<Return>", lambda e: self._handle_stop_submit(dlg))
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    def _handle_stop_submit(self, dlg):
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        self.stop_and_finalize()
+
     # ----------------- Events -----------------
     def toggle_data_collection(self):
         if not self.is_collecting_data:
@@ -699,12 +917,8 @@ class LeafPlateDetectionApp:
             self.session_meta.setdefault("start_time", datetime.now().strftime("%H:%M:%S"))
             self.toggle_button.configure(text="หยุด", fg_color="#e74c3c", hover_color="#c0392b")
         else:
-            if messagebox.askyesno("ยืนยันการหยุด", "ต้องการหยุดและบันทึกไฟล์รายงานหรือไม่?"):
-                self.is_collecting_data = False
-                self.toggle_button.configure(text="เริ่ม", fg_color="#3498db", hover_color="#2980b9")
-                directory = filedialog.askdirectory(title="เลือกโฟลเดอร์สำหรับบันทึกไฟล์รายงาน")
-                if directory:
-                    self.export_session_csv_and_json(directory)
+            # แสดงป๊อปอัปยืนยันแทนที่จะหยุดทันที
+            self.show_stop_confirm_dialog()
 
     def update_header_time(self):
         self.header_time_label.configure(text=datetime.now().strftime("%H:%M:%S"))
@@ -714,6 +928,9 @@ class LeafPlateDetectionApp:
         if self.is_collecting_data:
             if not messagebox.askyesno("ออกจากโปรแกรม", "กำลังตรวจจับอยู่ ต้องการออกทันทีหรือไม่?"):
                 return
+            # หยุด + export + อัปเดต meta
+            self.stop_and_finalize()
+
         self.stop_camera()
         self.app.destroy()
 
@@ -722,6 +939,14 @@ class LeafPlateDetectionApp:
         self.app.mainloop()
 
 
+# ----------------- Boot -----------------
 if __name__ == "__main__":
     app = LeafPlateDetectionApp()
+    app.initialize_data()
+    app.setup_app()
+    app.setup_fonts()
+    app.setup_camera()
+    app.setup_model()
+    app.create_widgets()
+    app.start_camera()
     app.run()
