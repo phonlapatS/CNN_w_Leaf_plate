@@ -84,14 +84,13 @@ class LeafPlateDetectionApp:
         # ตารางสถานะด้านล่าง (ค่าเริ่มต้น)
         self.defect_data = [
             ("รอยแตก", "ยังไม่พบ", "green"),
-            ("รูพรุนหรือรูเข็บ", "ยังไม่พบ", "green"),
-            ("จุดไหม้/คล้ำ", "ยังไม่ใช้", "green"),
-            ("รอยยับ/พับ", "ยังไม่ใช้", "green"),
-            ("รอยขีดข่วน", "ยังไม่ใช้", "green")
+            ("รูเข็ม", "ยังไม่พบ", "green"),
         ]
         self.status_labels = {}
-        # >>> ปรับคำแปล defect EN -> TH ตามที่ขอ <<<
+        # >>> ปรับคำแปล defect EN -> TH 
         self.defect_th_map = {"crack": "รอยแตก", "hole": "รูเข็ม"}
+        # เก็บสถานะเริ่มต้นของตาราง defect เพื่อรีเซ็ตเมื่อมีจานใหม่
+        self._defect_defaults = {d: (s, c) for d, s, c in self.defect_data}
 
         self.is_collecting_data = False
         self.camera_running = False
@@ -102,6 +101,7 @@ class LeafPlateDetectionApp:
         self.session_meta = {}
         self.plate_id_counter = 1
         self.lot_id = self.generate_lot_id()
+        self.lbl_lot = None
 
         # Path พื้นฐานและโฟลเดอร์บันทึก
         self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -122,6 +122,12 @@ class LeafPlateDetectionApp:
             "heart_shaped_leaf_plate": "heart",
             "rectangular_leaf_plate": "rectangle",
             "circle_leaf_plate": "circle",
+        }
+        # Display names for shapes in Thai
+        self.shape_display_map = {
+            "heart": "หัวใจ",
+            "rectangle": "สี่เหลี่ยมผืนผ้า",
+            "circle": "วงกลม",
         }
 
         # โฟลเดอร์รูป Annotated
@@ -144,6 +150,18 @@ class LeafPlateDetectionApp:
         self.lbl_heart = None
         self.lbl_rect  = None
         self.lbl_circle= None
+        # Plate gating state
+        self.gate_has_plate = False
+        self.gate_has_counted = False
+        self.gate_present_frames = 0
+        self.gate_absent_frames = 0
+        self.gate_present_thresh = 5
+        self.gate_absent_thresh = 10
+
+        # Plate status label placeholder
+        self.lbl_plate_status = None
+        # Latched defect counts per plate
+        self._latched_defect_counts = {"crack": 0, "hole": 0}
 
     # -----------------------------
     # Helpers for date/lot/defects
@@ -278,7 +296,7 @@ class LeafPlateDetectionApp:
 
         ctk.CTkLabel(
             header_frame,
-            text="Leaf Plate Defect Detection System",
+            text="โปรแกรมตรวจจับรอยตำหนิบนจานใบไม้",
             font=self.F(32, True),
             text_color="white"
         ).place(x=50, y=28)
@@ -310,20 +328,20 @@ class LeafPlateDetectionApp:
         left_frame = ctk.CTkFrame(
             self.app, width=self.left_w, height=self.TOP_H,
             fg_color="#ffffff", corner_radius=15,
-            border_width=2, border_color="#aed6f1"
+            border_width=2, border_color="#7A5429"
         )
         left_frame.place(x=self.M, y=self.TOP_Y)
 
         self.camera_frame = ctk.CTkFrame(
             left_frame, width=self.cam_w, height=self.cam_h,
-            fg_color="#e0f2f7", corner_radius=10,
-            border_width=1, border_color="#aed6f1"
+            fg_color="#E4DFDA", corner_radius=10,
+            border_width=1, border_color="#7A5429"
         )
         self.camera_frame.place(x=self.cam_pad, y=self.cam_pad)
 
         self.camera_label = tk.Label(
             self.camera_frame, text="Initializing Camera...",
-            font=self.FTK(16), fg="black", bg="#e0f2f7"
+            font=self.FTK(16), fg="black", bg="#7A5429"
         )
         self.camera_label.place(x=0, y=0, width=self.cam_w, height=self.cam_h)
 
@@ -337,7 +355,7 @@ class LeafPlateDetectionApp:
         self.toggle_button = ctk.CTkButton(
             button_frame, width=150, height=45, text="เริ่ม",
             font=self.F(16, True), text_color="#FFFFFF",
-            fg_color="#3498db", hover_color="#FFD700",
+            fg_color="#253BFA", hover_color="#0F0D69",
             command=self.toggle_data_collection
         )
         self.toggle_button.place(x=0, y=5)
@@ -345,7 +363,7 @@ class LeafPlateDetectionApp:
         export_button = ctk.CTkButton(
             button_frame, width=150, height=45, text="Export",
             font=self.F(16, True), text_color="#FFFFFF",
-            fg_color="#50C878", hover_color="#27ad60",
+            fg_color="#5BCADD", hover_color="#58AEBD",
             command=self.show_export_dialog
         )
         export_button.place(x=button_frame_w - 150, y=5)
@@ -354,21 +372,19 @@ class LeafPlateDetectionApp:
         right_x = self.M + self.left_w + self.GAP
         right_frame = ctk.CTkFrame(
             self.app, width=self.right_w, height=self.TOP_H,
-            fg_color="#ffffff", corner_radius=15,
-            border_width=2, border_color="#aed6f1"
+            fg_color="#E4DFDA", corner_radius=15,
+            border_width=2, border_color="#7A5429"
         )
         right_frame.place(x=right_x, y=self.TOP_Y)
 
-        self.create_total_count_card(right_frame)
-        self.create_shape_counts_card(right_frame)
-        self.create_session_info_card(right_frame)
+        self.create_unified_panel(right_frame)
 
     def create_total_count_card(self, parent):
         card_w = self.right_w - 40
         total_card = ctk.CTkFrame(
             parent, width=card_w, height=150,
-            fg_color="#e0f2f7", corner_radius=10,
-            border_width=2, border_color="#3498db"
+            fg_color="#E4DFDA", corner_radius=10,
+            border_width=2, border_color="#7A5429"
         )
         total_card.place(x=20, y=20)
 
@@ -387,8 +403,8 @@ class LeafPlateDetectionApp:
         card_w = self.right_w - 40
         shape_card = ctk.CTkFrame(
             parent, width=card_w, height=200,
-            fg_color="#e0f2f7", corner_radius=10,
-            border_width=2, border_color="#3498db"
+            fg_color="#E4DFDA", corner_radius=10,
+            border_width=2, border_color="#7A5429"
         )
         shape_card.place(x=20, y=190)
 
@@ -404,7 +420,7 @@ class LeafPlateDetectionApp:
         # Heart
         heart_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
         heart_frame.place(x=gap, y=y0)
-        ctk.CTkLabel(heart_frame, text="Heart", font=self.F(14, True), text_color="#e74c3c")\
+        ctk.CTkLabel(heart_frame, text="หัวใจ", font=self.F(14, True), text_color="#e74c3c")\
             .place(x=box_w // 2, y=30, anchor="center")
         self.lbl_heart = ctk.CTkLabel(heart_frame, text=str(self.shape_counts["heart"]),
                                       font=self.F(22, True), text_color="#1a2a3a")
@@ -413,7 +429,7 @@ class LeafPlateDetectionApp:
         # Rectangle
         rect_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
         rect_frame.place(x=gap * 2 + box_w, y=y0)
-        ctk.CTkLabel(rect_frame, text="Rectangle", font=self.F(14, True), text_color="#3498db")\
+        ctk.CTkLabel(rect_frame, text="สี่เหลี่ยมผืนผ้า", font=self.F(14, True), text_color="#199129")\
             .place(x=box_w // 2, y=30, anchor="center")
         self.lbl_rect = ctk.CTkLabel(rect_frame, text=str(self.shape_counts["rectangle"]),
                                      font=self.F(22, True), text_color="#1a2a3a")
@@ -422,7 +438,7 @@ class LeafPlateDetectionApp:
         # Circle
         circle_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
         circle_frame.place(x=gap * 3 + box_w * 2, y=y0)
-        ctk.CTkLabel(circle_frame, text="Circle", font=self.F(14, True), text_color="#199129")\
+        ctk.CTkLabel(circle_frame, text="วงกลม", font=self.F(14, True), text_color="#2AA7B8")\
             .place(x=box_w // 2, y=30, anchor="center")
         self.lbl_circle = ctk.CTkLabel(circle_frame, text=str(self.shape_counts["circle"]),
                                        font=self.F(22, True), text_color="#1a2a3a")
@@ -438,26 +454,145 @@ class LeafPlateDetectionApp:
         session_card.place(x=20, y=400)
 
         ctk.CTkLabel(
-            session_card, text="Current Session Info",
+            session_card, text="ข้อมูลการตรวจในรอบนี้",
             font=self.F(18, True), text_color="#1a2a3a"
         ).place(x=card_w // 2, y=18, anchor="center")
 
-        ctk.CTkLabel(session_card, text="พบตำหนิ: กดเริ่มเพื่อตรวจจับ",
-                     font=self.F(16), text_color="#e74c3c").place(x=40, y=50)
+        self.lbl_plate_status = ctk.CTkLabel(session_card, text="ยังไม่ตรวจ",
+                                             font=self.F(16, True), text_color="#e74c3c")
+        self.lbl_plate_status.place(x=40, y=50)
 
-        ctk.CTkLabel(session_card, text="จานที่ : -",
-                     font=self.F(15), text_color="#1a2a3a").place(x=40, y=78)
+        self.lbl_plate_no = ctk.CTkLabel(session_card, text="จานที่ : -",
+                     font=self.F(15), text_color="#1a2a3a")
+        self.lbl_plate_no.place(x=40, y=78)
 
-        lot_date = datetime.now().strftime("%d%m%Y")
-        ctk.CTkLabel(session_card, text=f"รหัสล็อต : PTP{lot_date}_01",
-                     font=self.F(15), text_color="#1a2a3a").place(x=40, y=104)
+        self.lbl_lot = ctk.CTkLabel(session_card, text=f"รหัสล็อต : {self.lot_id}",
+                     font=self.F(15), text_color="#1a2a3a")
+        self.lbl_lot.place(x=40, y=104)
 
+    def create_unified_panel(self, parent):
+        panel_w = self.right_w - 40
+        panel_h = self.TOP_H - 40
+
+        panel = ctk.CTkFrame(
+            parent, width=panel_w, height=panel_h,
+            fg_color="#E4DFDA", corner_radius=15,
+            border_width=0
+        )
+        panel.place(x=20, y=20)
+
+        # Title
+        ctk.CTkLabel(
+            panel, text="บันทึกได้ทั้งหมด",
+            font=self.F(26, True), text_color="#1a2a3a"
+        ).place(x=panel_w // 2, y=40, anchor="center")
+
+        # Total number
+        self.total_number_label = ctk.CTkLabel(
+            panel, text=str(self.shape_counts["total"]),
+            font=self.F(70, True), text_color="#e74c3c"
+        )
+        self.total_number_label.place(x=panel_w // 2, y=110, anchor="center")
+
+        # Subtitle
+        ctk.CTkLabel(
+            panel, text="จานแต่ละรูปทรง",
+            font=self.F(20, True), text_color="#1a2a3a"
+        ).place(x=panel_w // 2, y=180, anchor="center")
+
+        # Card size and layout
+        box_w, box_h = 220, 110
+        box_y = 220
+        gap = (panel_w - 3 * box_w) // 4
+
+        # Heart
+        heart_box = ctk.CTkFrame(panel, width=box_w, height=box_h,
+                             fg_color="#ffffff", corner_radius=18,
+                             border_width=0)
+        heart_box.place(x=gap, y=box_y)
+        ctk.CTkLabel(heart_box, text="หัวใจ", font=self.F(18, True),
+                 text_color="#e74c3c").place(x=box_w // 2, y=32, anchor="center")
+        self.lbl_heart = ctk.CTkLabel(heart_box, text=str(self.shape_counts["heart"]),
+                                  font=self.F(40, True), text_color="#1a2a3a")
+        self.lbl_heart.place(x=box_w // 2, y=70, anchor="center")
+
+        # Rectangle
+        rect_box = ctk.CTkFrame(panel, width=box_w, height=box_h,
+                            fg_color="#ffffff", corner_radius=18,
+                            border_width=0)
+        rect_box.place(x=gap * 2 + box_w, y=box_y)
+        ctk.CTkLabel(rect_box, text="สี่เหลี่ยมผืนผ้า", font=self.F(18, True),
+                 text_color="#199129").place(x=box_w // 2, y=32, anchor="center")
+        self.lbl_rect = ctk.CTkLabel(rect_box, text=str(self.shape_counts["rectangle"]),
+                                 font=self.F(40, True), text_color="#1a2a3a")
+        self.lbl_rect.place(x=box_w // 2, y=70, anchor="center")
+
+        # Circle
+        circle_box = ctk.CTkFrame(panel, width=box_w, height=box_h,
+                              fg_color="#ffffff", corner_radius=18,
+                              border_width=0)
+        circle_box.place(x=gap * 3 + box_w * 2, y=box_y)
+        ctk.CTkLabel(circle_box, text="วงกลม", font=self.F(18, True),
+                 text_color="#2AA7B8").place(x=box_w // 2, y=32, anchor="center")
+        self.lbl_circle = ctk.CTkLabel(circle_box, text=str(self.shape_counts["circle"]),
+                                   font=self.F(40, True), text_color="#1a2a3a")
+        self.lbl_circle.place(x=box_w // 2, y=70, anchor="center")
+
+        # Summary card
+        summary_card_y = box_y + box_h + 30
+        summary_card_h = panel_h - summary_card_y - 20
+        summary_card_w = panel_w - 2 * gap
+
+        summary_card = ctk.CTkFrame(panel, width=summary_card_w, height=summary_card_h,
+                                fg_color="#ffffff", corner_radius=18,
+                                border_width=0)
+        summary_card.place(x=gap, y=summary_card_y)
+
+        ctk.CTkLabel(
+            summary_card, text="สรุปผลการตรวจ",
+            font=self.F(20, True), text_color="#1a2a3a"
+        ).place(x=summary_card_w // 2, y=32, anchor="center")
+
+        # --- 4 rows, centered and spacingตามแบบ ---
+        label_x = 60
+        value_x = summary_card_w // 2 + 20
+        start_y = 70
+        row_height = 38
+
+        # 1. ลำดับจาน (อิงจาก shape_counts["total"])
+        self.lbl_plate_order = ctk.CTkLabel(summary_card, text=str(self.shape_counts["total"]),
+                                        font=self.F(18, True), text_color="#1a2a3a")
+        self.lbl_plate_order.place(x=value_x, y=start_y, anchor="w")
+        ctk.CTkLabel(summary_card, text="ลำดับจาน:", font=self.F(16), text_color="#1a2a3a")\
+        .place(x=label_x, y=start_y, anchor="w")
+
+        # 2. สถานะ
+        self.lbl_plate_status = ctk.CTkLabel(summary_card, text="ยังไม่ได้ตรวจ",
+                                         font=self.F(18, True), text_color="#888888")
+        self.lbl_plate_status.place(x=value_x, y=start_y + row_height, anchor="w")
+        ctk.CTkLabel(summary_card, text="สถานะ:", font=self.F(16), text_color="#1a2a3a")\
+        .place(x=label_x, y=start_y + row_height, anchor="w")
+
+        # 3. จำนวนข้อบกพร่อง
+        self.lbl_defect_count = ctk.CTkLabel(summary_card, text="ยังไม่พบ",
+                                         font=self.F(20, True), text_color="#888888")
+        self.lbl_defect_count.place(x=value_x, y=start_y + row_height * 2, anchor="w")
+        ctk.CTkLabel(summary_card, text="จำนวนข้อบกพร่อง:", font=self.F(16), text_color="#1a2a3a")\
+        .place(x=label_x, y=start_y + row_height * 2, anchor="w")
+
+        # 4. รหัสล็อต
+        self.lbl_lot = ctk.CTkLabel(summary_card, text=f"{self.lot_id}",
+                                font=self.F(16, True), text_color="#1a2a3a")
+        self.lbl_lot.place(x=value_x, y=start_y + row_height * 3, anchor="w")
+        ctk.CTkLabel(summary_card, text="รหัสล็อต:", font=self.F(16), text_color="#1a2a3a")\
+        .place(x=label_x, y=start_y + row_height * 3, anchor="w")
+#
     # Bottom
     def create_bottom_panel(self,):
         bottom_frame = ctk.CTkFrame(
             self.app, width=self.bottom_w, height=self.BOTTOM_H,
             fg_color="#ffffff", corner_radius=15,
-            border_width=2, border_color="#aed6f1"
+            border_width=2, border_color="#7A5429"
         )
         bottom_frame.place(x=self.M, y=self.BOTTOM_Y)
         self.create_defect_table(bottom_frame)
@@ -476,16 +611,16 @@ class LeafPlateDetectionApp:
         col1_x = int((table_w - 10) * 0.32)
         col2_x = int((table_w - 10) * 0.76)
 
-        ctk.CTkLabel(header_frame, text="Defect Type", font=self.F(16, True),
+        ctk.CTkLabel(header_frame, text="ประเภทตำหนิ", font=self.F(16, True),
                      text_color="white").place(x=col1_x, y=22, anchor="center")
-        ctk.CTkLabel(header_frame, text="Detection Status", font=self.F(16, True),
+        ctk.CTkLabel(header_frame, text="สถานะตำหนิ", font=self.F(16, True),
                      text_color="white").place(x=col2_x, y=22, anchor="center")
 
         row_start_y = 55
         row_h = 36
         for i, (defect, status, color) in enumerate(self.defect_data):
             row_y = row_start_y + i * row_h
-            row_color = "#ffffff" if i % 2 == 0 else "#e0f2f7"
+            row_color = "#ffffff" if i % 2 == 0 else "#E4DFDA"
             row_frame = ctk.CTkFrame(table_frame, width=table_w - 10, height=row_h,
                                      fg_color=row_color, corner_radius=0)
             row_frame.place(x=5, y=row_y)
@@ -558,6 +693,7 @@ class LeafPlateDetectionApp:
         csv_path = self._write_csv(directory)
         json_path = self._write_json(directory)
         messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}\n{os.path.basename(json_path)}")
+        self._reset_all_and_next_lot()
 
     def show_export_dialog(self):
         dialog = ctk.CTkToplevel(self.app)
@@ -583,7 +719,7 @@ class LeafPlateDetectionApp:
 
         ctk.CTkButton(
             dialog, width=220, height=38, text="Export Both", font=self.F(12, True),
-            text_color="#FFFFFF", fg_color="#3498db", hover_color="#2980b9",
+            text_color="#FFFFFF", fg_color="#7A5429", hover_color="#2980b9",
             command=lambda: self.save_collected_to_csv_and_json(dialog)
         ).place(x=160, y=170, anchor="center")
 
@@ -596,6 +732,7 @@ class LeafPlateDetectionApp:
             csv_path = self._write_csv(directory)
             messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}")
             dialog.destroy()
+            self._reset_all_and_next_lot()
 
     def save_to_json(self, dialog):
         if not self.session_rows:
@@ -606,6 +743,7 @@ class LeafPlateDetectionApp:
             json_path = self._write_json(directory)
             messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(json_path)}")
             dialog.destroy()
+            self._reset_all_and_next_lot()
 
     def save_collected_to_csv_and_json(self, dialog):
         if not self.session_rows:
@@ -620,6 +758,7 @@ class LeafPlateDetectionApp:
                 f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}\n{os.path.basename(json_path)}"
             )
             dialog.destroy()
+            self._reset_all_and_next_lot()
 
     # ----------------- Auto-save (CSV/JSON in ./savefile) + Firebase -----------------
     def _ensure_session_files(self):
@@ -691,6 +830,77 @@ class LeafPlateDetectionApp:
         # โพสต์แถวล่าสุดเข้า Firebase (POST)
         self._firebase_post(f"sessions/{self.firebase_session_key}/records", row)
 
+    # ----------------- Lot/Reset helpers -----------------
+    def _update_lot_label(self):
+        try:
+            if self.lbl_lot is not None:
+                self.lbl_lot.configure(text=f"รหัสล็อต : {self.lot_id}")
+        except Exception:
+            pass
+
+    def _increment_lot_id(self):
+        try:
+            now_date_short = datetime.now().strftime("%y%m%d")
+            base = f"PTP{now_date_short}"
+            seq = 1
+            if isinstance(self.lot_id, str) and "_" in self.lot_id and self.lot_id.startswith("PTP"):
+                old_base, old_seq = self.lot_id.split("_", 1)
+                if old_base.endswith(now_date_short):
+                    try:
+                        seq = int(old_seq) + 1
+                    except Exception:
+                        seq = 1
+            self.lot_id = f"{base}_{seq:02d}"
+        except Exception:
+            # fallback
+            self.lot_id = self.generate_lot_id()
+        self._update_lot_label()
+
+    def _reset_all_and_next_lot(self):
+        # Reset counters
+        self.shape_counts = {"heart": 0, "rectangle": 0, "circle": 0, "total": 0}
+        try:
+            if self.lbl_heart:  self.lbl_heart.configure(text="0")
+            if self.lbl_rect:   self.lbl_rect.configure(text="0")
+            if self.lbl_circle: self.lbl_circle.configure(text="0")
+            self.total_number_label.configure(text="0")
+            if self.lbl_plate_order: self.lbl_plate_order.configure(text="0")
+            if self.lbl_defect_count: self.lbl_defect_count.configure(text="ยังไม่พบ", text_color="#888888")
+            if self.lbl_plate_status: self.lbl_plate_status.configure(text="ยังไม่ได้ตรวจ", text_color="#888888")
+        except Exception:
+            pass
+
+        # Reset session data
+        self.session_rows = []
+        self.session_meta = {}
+        self.plate_id_counter = 1
+        if hasattr(self, "lbl_plate_no") and self.lbl_plate_no is not None:
+            try:
+                self.lbl_plate_no.configure(text="จานที่ : -")
+            except Exception:
+                pass
+
+        # Reset autosave / Firebase session
+        self._auto_csv_path = None
+        self._auto_json_path = None
+        self._session_stamp = None
+        self.firebase_session_key = None
+
+        # Reset gating and statuses
+        self.gate_has_plate = False
+        self.gate_has_counted = False
+        self.gate_present_frames = 0
+        self.gate_absent_frames = 0
+        self._set_plate_status("pending")
+        try:
+            self._reset_defect_table()
+            self._render_latched_defect_counts()
+        except Exception:
+            pass
+
+        # Move to next lot id
+        self._increment_lot_id()
+
     # ----------------- Detection helpers -----------------
     def _update_shape_counters(self, shapes_found: set):
         if not shapes_found:
@@ -699,6 +909,10 @@ class LeafPlateDetectionApp:
             if shp in self.shape_counts:
                 self.shape_counts[shp] += 1
                 self.shape_counts["total"] += 1
+
+        # อัปเดตเลขลำดับจานใน summary card ด้วย
+        if self.lbl_plate_order:
+            self.lbl_plate_order.configure(text=str(self.shape_counts["total"]))
 
         if self.lbl_heart:  self.lbl_heart.configure(text=str(self.shape_counts["heart"]))
         if self.lbl_rect:   self.lbl_rect.configure(text=str(self.shape_counts["rectangle"]))
@@ -713,6 +927,69 @@ class LeafPlateDetectionApp:
             lbl = self.status_labels.get(th_name)
             if lbl:
                 lbl.configure(text="พบตำหนิ", text_color="#e74c3c")
+
+    # ----------------- Additional defect counts UI (parity with GUI_mac) -----------------
+    def _update_defect_counts_ui(self, defect_counts: dict):
+        """Update bottom table with numeric counts per defect (red when >0, else green 'ยังไม่พบ')."""
+        for en_name, th_name in self.defect_th_map.items():
+            lbl = self.status_labels.get(th_name)
+            if not lbl:
+                continue
+            cnt = int(defect_counts.get(en_name, 0))
+            if cnt > 0:
+                lbl.configure(text=str(cnt), text_color="#e74c3c")
+            else:
+                default_status, default_color = self._defect_defaults.get(th_name, ("ยังไม่พบ", "green"))
+                status_color = "#199129" if default_color == "green" else "#e74c3c"
+                lbl.configure(text=default_status, text_color=status_color)
+
+    def _reset_defect_table(self):
+        """รีเซ็ตตารางสถานะ defect กลับค่าเริ่มต้น เมื่อเริ่มตรวจจานใหม่"""
+        for k in list(self._latched_defect_counts.keys()):
+            self._latched_defect_counts[k] = 0
+        for defect, (status, color) in self._defect_defaults.items():
+            lbl = self.status_labels.get(defect)
+            if lbl:
+                status_color = "#199129" if color == "green" else "#e74c3c"
+                lbl.configure(text=status, text_color=status_color)
+
+    def _render_latched_defect_counts(self):
+        for en_name, th_name in self.defect_th_map.items():
+            lbl = self.status_labels.get(th_name)
+            if not lbl:
+                continue
+            cnt = int(self._latched_defect_counts.get(en_name, 0))
+            if cnt > 0:
+                lbl.configure(text=str(cnt), text_color="#e74c3c")
+            else:
+                default_status, default_color = self._defect_defaults.get(th_name, ("ยังไม่พบ", "green"))
+                status_color = "#199129" if default_color == "green" else "#e74c3c"
+                lbl.configure(text=default_status, text_color=status_color)
+
+    def _set_plate_status(self, mode: str, defect_count=None):
+        # ปรับสถานะและสีตามที่ระบุ
+        if not self.lbl_plate_status:
+            return
+        if mode == "pending":
+            self.lbl_plate_status.configure(text="ยังไม่ได้ตรวจ", text_color="#888888")
+            self.lbl_defect_count.configure(text="ยังไม่พบ", text_color="#888888")
+        elif mode == "pass":
+            self.lbl_plate_status.configure(text="ผ่าน", text_color="#199129")
+            self.lbl_defect_count.configure(text="ไม่มีตำหนิ", text_color="#888888")
+        elif mode == "fail":
+            self.lbl_plate_status.configure(text="มีตำหนิ", text_color="#e74c3c")
+            if defect_count is not None and defect_count > 0:
+                self.lbl_defect_count.configure(text=str(defect_count), text_color="#e74c3c")
+            else:
+                self.lbl_defect_count.configure(text="ไม่มีตำหนิ", text_color="#888888")
+        elif mode == "counted":
+            # กรณีผ่าน/มีตำหนิพร้อมกัน (ถ้าต้องการแสดงแบบรวม)
+            if defect_count is not None and defect_count > 0:
+                self.lbl_plate_status.configure(text="มีตำหนิ", text_color="#e74c3c")
+                self.lbl_defect_count.configure(text=str(defect_count), text_color="#e74c3c")
+            else:
+                self.lbl_plate_status.configure(text="ผ่าน", text_color="#199129")
+                self.lbl_defect_count.configure(text="ไม่มีตำหนิ", text_color="#888888")
 
     def _save_detection_record(self, annotated_bgr, defect_names: set, shapes_found: set):
         now = datetime.now()
@@ -729,8 +1006,12 @@ class LeafPlateDetectionApp:
         defects_th = [self.defect_th_map.get(d, d) for d in sorted(defect_names)]
         defects_text = " - " if not defects_th else " / ".join(defects_th)
 
-        # สรุปรูปทรง (กรณีพบหลายรูปทรง ให้รวมด้วย '/')
-        shape_text = "-" if not shapes_found else " / ".join(sorted(shapes_found))
+        # สรุปรูปทรง (กรณีพบหลายรูปทรง ให้รวมด้วย '/'), แสดงเป็นภาษาไทย
+        if not shapes_found:
+            shape_text = "-"
+        else:
+            thai_shapes = [self.shape_display_map.get(s, s) for s in sorted(shapes_found)]
+            shape_text = " / ".join(thai_shapes)
 
         # สร้างแถวข้อมูล (เพิ่มคีย์ shape)
         row = {
@@ -751,9 +1032,10 @@ class LeafPlateDetectionApp:
     def _annotate_and_summarize(self, frame_bgr, res):
         annotated = frame_bgr.copy()
         shapes_found, defect_names = set(), set()
+        defect_counts = {}
 
         if not hasattr(res, "boxes") or res.boxes is None:
-            return annotated, shapes_found, defect_names
+            return annotated, shapes_found, defect_counts, defect_names
 
         names = self.model.names
         boxes = res.boxes
@@ -772,8 +1054,9 @@ class LeafPlateDetectionApp:
                 shapes_found.add(self.shape_map[label])
             if label in self.defect_classes:
                 defect_names.add(label)
+                defect_counts[label] = defect_counts.get(label, 0) + 1
 
-        return annotated, shapes_found, defect_names
+        return annotated, shapes_found, defect_counts, defect_names
 
     # ----------------- Camera update -----------------
     def start_camera(self):
@@ -806,17 +1089,63 @@ class LeafPlateDetectionApp:
                     verbose=False
                 )
                 res = results[0]
-                annotated, shapes_found, defect_names = self._annotate_and_summarize(frame_resized, res)
+                annotated, shapes_found, defect_counts, defect_names = self._annotate_and_summarize(frame_resized, res)
                 frame_to_show = annotated
 
-                if (shapes_found or defect_names):
-                    now_ms = time.time() * 1000.0
-                    if now_ms - self._last_save_ms >= self.save_cooldown_ms:
-                        self._update_shape_counters(shapes_found)
-                        row = self._save_detection_record(annotated, defect_names, shapes_found)
-                        # เซฟ CSV/JSON อัตโนมัติ + ส่ง Firebase
-                        self._append_csv_json_and_firebase(row)
-                        self._last_save_ms = now_ms
+                # อัปเดตตาราง defect ด้วยจำนวน defect ล่าสุด
+                self._update_defect_counts_ui(defect_counts)
+
+                # Single-count gating per plate
+                plate_detected = (len(shapes_found) > 0) or (len(defect_names) > 0)
+                # อัปเดตตัวเลข defect แบบค้างต่อจาน (monotonic)
+                if plate_detected:
+                    for k, v in defect_counts.items():
+                        try:
+                            iv = int(v)
+                        except Exception:
+                            iv = 0
+                        self._latched_defect_counts[k] = max(self._latched_defect_counts.get(k, 0), iv)
+                    self._render_latched_defect_counts()
+                if plate_detected:
+                    self.gate_present_frames += 1
+                    self.gate_absent_frames = 0
+                else:
+                    self.gate_absent_frames += 1
+                    self.gate_present_frames = 0
+
+                # New stable plate appears
+                if (not self.gate_has_plate) and plate_detected and self.gate_present_frames >= self.gate_present_thresh:
+                    self.gate_has_plate = True
+                    self.gate_has_counted = False
+                    self._set_plate_status("pending")
+                    # รีเซ็ตตาราง defect สำหรับจานใหม่
+                    self._reset_defect_table()
+                    self._render_latched_defect_counts()
+
+                # Count once per plate
+                if self.gate_has_plate and (not self.gate_has_counted) and self.gate_present_frames >= self.gate_present_thresh:
+                    self._update_shape_counters(shapes_found)
+                    # If only defects detected (no shapes), still increment total count
+                    if (not shapes_found) and (len(defect_names) > 0):
+                        self.shape_counts["total"] += 1
+                        self.total_number_label.configure(text=str(self.shape_counts["total"]))
+                    row = self._save_detection_record(annotated, defect_names, shapes_found)
+                    # เซฟ CSV/JSON อัตโนมัติ + ส่ง Firebase
+                    self._append_csv_json_and_firebase(row)
+                    defect_count = sum(defect_counts.values())  # <--- เพิ่มบรรทัดนี้
+                    self._set_plate_status("counted", defect_count)  # <--- ส่ง defect_count เข้าไป
+                    self.gate_has_counted = True
+                    self._last_save_ms = time.time() * 1000.0
+                    # อัปเดตป้ายเลขจานปัจจุบัน
+                    if hasattr(self, "lbl_plate_no") and self.lbl_plate_no is not None:
+                        self.lbl_plate_no.configure(text=f"จานที่ : {row['plate_id']}")
+
+                # Plate removed -> reset gate
+                if self.gate_has_plate and self.gate_absent_frames >= self.gate_absent_thresh:
+                    self.gate_has_plate = False
+                    self.gate_has_counted = False
+                    self._set_plate_status("pending")
+
             except Exception as e:
                 print(f"Inference error: {e}")
                 frame_to_show = frame_resized
@@ -839,7 +1168,7 @@ class LeafPlateDetectionApp:
         """หยุดการตรวจ + export อัตโนมัติลง ./savefile/ + อัปเดต meta ไป Firebase"""
         self.is_collecting_data = False
         try:
-            self.toggle_button.configure(text="เริ่ม", fg_color="#3498db", hover_color="#2980b9")
+            self.toggle_button.configure(text="เริ่ม", fg_color="#297A3A", hover_color="#2980b9")
         except Exception:
             pass
 
@@ -847,6 +1176,11 @@ class LeafPlateDetectionApp:
             try:
                 self._write_csv(self.save_root)
                 self._write_json(self.save_root)
+                self._reset_all_and_next_lot()
+                try:
+                    messagebox.showinfo("Reset", f"รีเซ็ตข้อมูลเรียบร้อย\nรหัสล็อตใหม่: {self.lot_id}")
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[Export at stop] failed: {e}")
 
@@ -860,6 +1194,8 @@ class LeafPlateDetectionApp:
                 }
             }
             self._firebase_put(f"sessions/{self.firebase_session_key}/meta", meta)
+        # Reset plate status when finalized
+        self._set_plate_status("pending")
 
     def show_stop_confirm_dialog(self):
         """แสดงป๊อปอัปยืนยันการหยุด: Submit (ยืนยัน) / ตรวจต่อ"""
@@ -916,6 +1252,19 @@ class LeafPlateDetectionApp:
             self.is_collecting_data = True
             self.session_meta.setdefault("start_time", datetime.now().strftime("%H:%M:%S"))
             self.toggle_button.configure(text="หยุด", fg_color="#e74c3c", hover_color="#c0392b")
+            # Reset gating state when starting
+            self.gate_has_plate = False
+            self.gate_has_counted = False
+            self.gate_present_frames = 0
+            self.gate_absent_frames = 0
+            self._set_plate_status("pending")
+            # รีเซ็ตตาราง defect และอัปเดตเลขจานที่ทำเสร็จก่อนหน้า
+            try:
+                self._reset_defect_table()
+                if hasattr(self, "lbl_plate_no") and self.lbl_plate_no is not None:
+                    self.lbl_plate_no.configure(text=f"จานที่ : {self.plate_id_counter - 1}")
+            except Exception:
+                pass
         else:
             # แสดงป๊อปอัปยืนยันแทนที่จะหยุดทันที
             self.show_stop_confirm_dialog()
