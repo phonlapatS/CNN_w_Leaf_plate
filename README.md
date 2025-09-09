@@ -1,4 +1,5 @@
 # How to setup this project
+** this project use python version 3.10.7 **
 ### Build Environment for python
 python -m venv yolo-env
 name....\Scripts\activate
