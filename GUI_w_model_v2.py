@@ -512,7 +512,7 @@ class LeafPlateDetectionApp:
         self.cam_w = self.left_w - (self.cam_pad * 2)
 
         # ----- Button palette (รีสกินปุ่ม) -----
-        self.COLOR_PRIMARY = "#3465CF"         # Blue-600
+        self.COLOR_PRIMARY = "#2563EB"         # Blue-600
         self.COLOR_PRIMARY_HOVER = "#1E40AF"   # Blue-800
         self.COLOR_DANGER = "#DC2626"          # Red-600
         self.COLOR_DANGER_HOVER = "#B91C1C"    # Red-700
