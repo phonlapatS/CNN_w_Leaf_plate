@@ -28,7 +28,6 @@ class LeafPlateTwoStageApp:
       Stage-1: shape_model  -> circle/heart/rectangle
       Stage-2: defect_model -> crack/hole
     - รวมผล → แสดง/บันทึก/ส่ง Firebase
-    - ป้องกันปัญหา Ctrl+C ด้วย safe_after + SIGINT hook
     """
 
     # -----------------------------
@@ -106,8 +105,7 @@ class LeafPlateTwoStageApp:
         os.makedirs(self.save_root, exist_ok=True)
 
         # ---------- YOLO / Detection ----------
-        # ตั้ง path โมเดลสอง-stage (ปรับชื่อไฟล์ตามของคุณ)
-        self.SHAPE_WEIGHTS  = os.path.join(self.BASE_DIR, "models", "shape_best.pt")
+        self.SHAPE_WEIGHTS  = os.path.join(self.BASE_DIR, "models", "shape_best_rf.pt")
         self.DEFECT_WEIGHTS = os.path.join(self.BASE_DIR, "models", "defect_best.pt")
 
         self.shape_model  = None
@@ -117,8 +115,8 @@ class LeafPlateTwoStageApp:
         self.imgsz = 896
 
         # threshold แยกกันสำหรับสองโมเดล
-        self.conf_shape = 0.30
-        self.iou_shape  = 0.60
+        self.conf_shape = 0.55
+        self.iou_shape  = 0.70
         self.conf_defect= 0.25
         self.iou_defect = 0.65
 
@@ -177,6 +175,16 @@ class LeafPlateTwoStageApp:
 
         # defect counts ต่อจาน (latched)
         self._latched_defect_counts = {"crack": 0, "hole": 0}
+
+        # ติดตาม bbox จานก่อนไว้เทียบ IoU
+        self._last_plate_bbox = None
+        self._ioulow_frames = 0
+        self._iou_new_plate_thresh = 0.18  # ต่ำกว่านี้ถือว่าเป็นจานใหม่
+
+        # NEW: จับ “เปลี่ยนรูปทรงต่อเนื่อง = จานใหม่” แม้ IoU สูง
+        self._last_shapes = set()
+        self._shape_change_frames = 0
+        self._shape_change_thresh = 5  # เห็นรูปทรงใหม่ซ้ำ 5 เฟรมค่อยยอม
 
     # -----------------------------
     # Helpers for date/lot/defects
@@ -290,6 +298,7 @@ class LeafPlateTwoStageApp:
         if not self.cap or not self.cap.isOpened():
             print("Cannot open camera"); self.cap = None; return
 
+        # คงไว้เฉพาะขนาดเฟรม (ไม่ยุ่งค่า auto-focus/auto-exposure)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
@@ -802,6 +811,12 @@ class LeafPlateTwoStageApp:
         except Exception:
             pass
 
+        # reset tracking states
+        self._last_plate_bbox = None
+        self._ioulow_frames = 0
+        self._last_shapes = set()
+        self._shape_change_frames = 0
+
         self._increment_lot_id()
 
     # ----------------- Detection helpers -----------------
@@ -922,13 +937,44 @@ class LeafPlateTwoStageApp:
         self._update_defect_status_ui(defect_names)
         return row
 
+    # bbox helpers
+    def _union_bbox(self, xyxy_list):
+        if len(xyxy_list) == 0:
+            return None
+        xs1 = [b[0] for b in xyxy_list]
+        ys1 = [b[1] for b in xyxy_list]
+        xs2 = [b[2] for b in xyxy_list]
+        ys2 = [b[3] for b in xyxy_list]
+        return [int(min(xs1)), int(min(ys1)), int(max(xs2)), int(max(ys2))]
+
+    def _bbox_iou(self, a, b):
+        if a is None or b is None:
+            return 0.0
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        inter_x1 = max(ax1, bx1); inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2); inter_y2 = min(ay2, by2)
+        iw = max(0, inter_x2 - inter_x1)
+        ih = max(0, inter_y2 - inter_y1)
+        inter = iw * ih
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union = area_a + area_b - inter
+        if union <= 0:
+            return 0.0
+        return inter / union
+
     def _annotate_and_summarize_two_stage(self, frame_bgr, shape_res, defect_res):
         """
-        รวมผลสองโมเดลในเฟรมเดียว → annotate + สรุป set ต่างๆ
+        รวมผลสองโมเดลในเฟรมเดียว → annotate + คืนสรุป
         """
         annotated = frame_bgr.copy()
         shapes_found, defect_names = set(), set()
         defect_counts = {}
+
+        shape_xyxy_all = []
+        shape_labels   = []   
+        defect_xyxy_all = []
 
         # stage-1: shapes
         if shape_res is not None and hasattr(shape_res, "boxes") and shape_res.boxes is not None:
@@ -940,13 +986,27 @@ class LeafPlateTwoStageApp:
 
             for (x1, y1, x2, y2), c, p in zip(xyxy, clss, conf):
                 label = names.get(int(c), str(c))
-                # เฉพาะคลาสรูปทรงเท่านั้น
                 if label in self.shape_classes_ultra:
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 140, 255), 2)
                     cv2.putText(annotated, f"{label} {p:.2f}", (x1, max(20, y1 - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (10, 90, 255), 2, cv2.LINE_AA)
                     short = self.shape_map.get(label, label)
                     shapes_found.add(short)
+                    shape_xyxy_all.append([x1, y1, x2, y2])
+
+        # --- คัดให้เหลือกล่องเดียวถ้าเกิดมีหลายกล่อง ---
+        if len(shape_xyxy_all) > 1:
+          areas = [(x2 - x1) * (y2 - y1) for (x1, y1, x2, y2) in shape_xyxy_all]
+          keep = int(np.argmax(areas))
+          shape_xyxy_all = [shape_xyxy_all[keep]]
+          # ตั้งชื่อให้ตรงกับกรอบที่คงไว้
+          if shape_labels:
+              shapes_found = {shape_labels[keep]}
+          else:
+              # กันพลาดถ้าไม่มี labels (ป้องกันไม่ให้เกิด)
+              if len(shapes_found) > 1:
+                  shapes_found = {next(iter(shapes_found))}
+
 
         # stage-2: defects
         if defect_res is not None and hasattr(defect_res, "boxes") and defect_res.boxes is not None:
@@ -958,14 +1018,21 @@ class LeafPlateTwoStageApp:
 
             for (x1, y1, x2, y2), c, p in zip(xyxy, clss, conf):
                 label = names.get(int(c), str(c))
-                if label in self.defect_classes_ultra:
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 40, 40), 2)
+                if label in self.shape_classes_ultra:
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 140, 255), 2)
                     cv2.putText(annotated, f"{label} {p:.2f}", (x1, max(20, y1 - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 255), 2, cv2.LINE_AA)
-                    defect_names.add(label)
-                    defect_counts[label] = defect_counts.get(label, 0) + 1
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (10, 90, 255), 2, cv2.LINE_AA)
+                    short = self.shape_map.get(label, label)
+                    shapes_found.add(short)
+                    shape_xyxy_all.append([x1, y1, x2, y2])
+                    shape_labels.append(short)  # ให้เก็บชนิดของกรอบด้วย
 
-        return annotated, shapes_found, defect_counts, defect_names
+        # union bbox of shapes (fallback defects)
+        union_bbox = self._union_bbox(shape_xyxy_all) if len(shape_xyxy_all) > 0 else self._union_bbox(defect_xyxy_all)
+
+        return annotated, shapes_found, defect_counts, defect_names, union_bbox
+    
+    
 
     # ----------------- Camera loop (safe_after) -----------------
     def safe_after(self, delay_ms, func):
@@ -1008,8 +1075,10 @@ class LeafPlateTwoStageApp:
                 shape_results = self.shape_model.predict(
                     source=frame_resized,
                     imgsz=self.imgsz,
-                    conf=self.conf_shape,
-                    iou=self.iou_shape,
+                    conf=0.55,
+                    iou=0.72,
+                    max_det=1,
+                    agnostic_nms=True,
                     verbose=False
                 )
                 shape_res = shape_results[0]
@@ -1024,7 +1093,7 @@ class LeafPlateTwoStageApp:
                 )
                 defect_res = defect_results[0]
 
-                annotated, shapes_found, defect_counts, defect_names = \
+                annotated, shapes_found, defect_counts, defect_names, union_bbox = \
                     self._annotate_and_summarize_two_stage(frame_resized, shape_res, defect_res)
 
                 frame_to_show = annotated
@@ -1052,13 +1121,60 @@ class LeafPlateTwoStageApp:
                     self.gate_absent_frames += 1
                     self.gate_present_frames = 0
 
-                # New stable plate appears
+                # ถ้านับไปแล้ว แล้วยังมีวัตถุอยู่ และ IoU กับกรอบเดิมต่ำต่อเนื่อง -> จานใหม่
+                if self.gate_has_plate and self.gate_has_counted and plate_detected and union_bbox is not None:
+                    iou = self._bbox_iou(self._last_plate_bbox, union_bbox)
+                    if iou < self._iou_new_plate_thresh:
+                        self._ioulow_frames += 1
+                    else:
+                        self._ioulow_frames = 0
+
+                    if self._ioulow_frames >= self.gate_present_thresh:
+                        self._reset_defect_table()
+                        self._render_latched_defect_counts()
+                        self.gate_has_plate = True
+                        self.gate_has_counted = False
+                        self._set_plate_status("pending")
+                        self.gate_present_frames = self.gate_present_thresh
+                        self.gate_absent_frames = 0
+                        self._last_plate_bbox = union_bbox
+                        self._ioulow_frames = 0
+                        self._last_shapes = set(shapes_found)
+                        self._shape_change_frames = 0
+
+                # NEW: ถ้านับไปแล้ว และรูปทรงในเฟรม "ต่างจากจานก่อน" ต่อเนื่องหลายเฟรม -> จานใหม่
+                if self.gate_has_plate and self.gate_has_counted and plate_detected:
+                    if len(shapes_found) > 0 and set(shapes_found) != set(self._last_shapes):
+                        self._shape_change_frames += 1
+                    else:
+                        self._shape_change_frames = 0
+
+                    if self._shape_change_frames >= self._shape_change_thresh:
+                        self._reset_defect_table()
+                        self._render_latched_defect_counts()
+                        self.gate_has_plate = True
+                        self.gate_has_counted = False
+                        self._set_plate_status("pending")
+                        self.gate_present_frames = self.gate_present_thresh
+                        self.gate_absent_frames = 0
+                        self._last_plate_bbox = union_bbox
+                        self._ioulow_frames = 0
+                        self._last_shapes = set(shapes_found)
+                        self._shape_change_frames = 0
+
+                # New stable plate appears (ปกติ)
                 if (not self.gate_has_plate) and plate_detected and self.gate_present_frames >= self.gate_present_thresh:
+                    self._reset_defect_table()
+                    self._render_latched_defect_counts()
+
                     self.gate_has_plate = True
                     self.gate_has_counted = False
                     self._set_plate_status("pending")
-                    self._reset_defect_table()
-                    self._render_latched_defect_counts()
+
+                    self._last_plate_bbox = union_bbox
+                    self._ioulow_frames = 0
+                    self._last_shapes = set(shapes_found)
+                    self._shape_change_frames = 0
 
                 # Count once per plate
                 if self.gate_has_plate and (not self.gate_has_counted) and self.gate_present_frames >= self.gate_present_thresh:
@@ -1075,6 +1191,11 @@ class LeafPlateTwoStageApp:
                     self.gate_has_counted = True
                     self._last_save_ms = time.time() * 1000.0
 
+                    self._last_plate_bbox = union_bbox
+                    self._ioulow_frames = 0
+                    self._last_shapes = set(shapes_found)
+                    self._shape_change_frames = 0
+
                     if hasattr(self, "lbl_plate_no") and self.lbl_plate_no is not None:
                         try:
                             self.lbl_plate_no.configure(text=f"จานที่ : {row['plate_id']}")
@@ -1085,7 +1206,12 @@ class LeafPlateTwoStageApp:
                 if self.gate_has_plate and self.gate_absent_frames >= self.gate_absent_thresh:
                     self.gate_has_plate = False
                     self.gate_has_counted = False
+                    self.gate_present_frames = 0
                     self._set_plate_status("pending")
+                    self._last_plate_bbox = None
+                    self._ioulow_frames = 0
+                    self._last_shapes = set()
+                    self._shape_change_frames = 0
 
             except Exception as e:
                 print(f"Inference error: {e}")
@@ -1201,6 +1327,12 @@ class LeafPlateTwoStageApp:
                     self.lbl_plate_no.configure(text=f"จานที่ : {self.plate_id_counter - 1}")
             except Exception:
                 pass
+
+            # reset tracking states on start
+            self._last_plate_bbox = None
+            self._ioulow_frames = 0
+            self._last_shapes = set()
+            self._shape_change_frames = 0
         else:
             self.show_stop_confirm_dialog()
 
@@ -1244,7 +1376,6 @@ if __name__ == "__main__":
     try:
         app.run()
     except KeyboardInterrupt:
-        # ปิดให้เรียบร้อย ถ้ามี Ctrl+C จากคอนโซล
         try:
             app.on_closing()
         except Exception:
