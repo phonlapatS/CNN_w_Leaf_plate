@@ -1,0 +1,1167 @@
+# GUI.py
+# -*- coding: utf-8 -*-
+# ต้องมีไฟล์ service account ชื่อ firebase_private.json วางข้างไฟล์นี้
+# ติดตั้งที่ต้องใช้: pip install customtkinter ultralytics opencv-python pillow firebase-admin
+
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import font as tkfont
+from tkinter import filedialog, messagebox  # เมนู Export ยังใช้ได้
+
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+from ultralytics import YOLO
+
+from datetime import datetime
+import os, sys, json, csv, time
+import urllib.request, urllib.error  # fallback REST ถ้า Admin SDK init ไม่สำเร็จ
+import uuid
+from datetime import datetime, timezone
+
+# -------- Firebase Admin SDK --------
+import firebase_admin
+from firebase_admin import credentials, db
+
+
+class LeafPlateDetectionApp:
+    """
+    Leaf Plate Defect Detection Application
+    - โหลดโมเดล best.pt ข้างไฟล์
+    - ถ้าตรวจเจอ => เซฟภาพ + append CSV + update JSON ใน ./savefile/
+      และ push แถวล่าสุดขึ้น Firebase ทันที
+    - ปุ่ม "หยุด" มีป๊อปอัปยืนยัน: Submit (ยืนยัน) / ตรวจต่อ
+    - เมนู Export เดิมยังอยู่เหมือนเดิม
+    """
+
+    # -----------------------------
+    # Layout constants for Full HD
+    # -----------------------------
+    def set_layout_constants(self):
+        # Use current screen size (self.W, self.H) and scale layout proportionally
+        self.M = max(16, int(min(self.W, self.H) * 0.013))
+        self.HEADER_Y = int(self.M * 0.8)
+        self.HEADER_H = int(self.H * 0.083)
+        self.TOP_Y = self.HEADER_Y + self.HEADER_H + int(self.M * 0.2)
+        self.TOP_H = int(self.H * 0.60)
+        self.GAP = self.M
+        self.header_w = self.W - 2 * self.M
+        self.left_w = int(self.header_w * 0.58)
+        self.right_w = self.header_w - self.left_w - self.GAP
+        self.BOTTOM_Y = self.TOP_Y + self.TOP_H + int(self.M * 0.3)
+        self.BOTTOM_H = self.H - self.BOTTOM_Y - self.M
+        self.bottom_w = self.header_w
+        self.cam_pad = int(self.M * 0.8)
+        self.cam_h = int(self.TOP_H * 0.84)
+        self.cam_w = self.left_w - (self.cam_pad * 2)
+
+    # -----------------------------
+    # Fonts (force Arial)
+    # -----------------------------
+    def setup_fonts(self):
+        self.FONT_FAMILY = "Arial"
+        for name in (
+            "TkDefaultFont", "TkHeadingFont", "TkTextFont", "TkMenuFont",
+            "TkFixedFont", "TkTooltipFont", "TkCaptionFont",
+            "TkSmallCaptionFont", "TkIconFont"
+        ):
+            try:
+                tkfont.nametofont(name).configure(family=self.FONT_FAMILY)
+            except tk.TclError:
+                pass
+        self.F   = lambda size, bold=False: ctk.CTkFont(
+            family=self.FONT_FAMILY, size=size, weight=("bold" if bold else "normal")
+        )
+        self.FTK = lambda size, bold=False: (
+            (self.FONT_FAMILY, size, "bold") if bold else (self.FONT_FAMILY, size)
+        )
+
+    # -----------------------------
+    # Data / Config
+    # -----------------------------
+    def initialize_data(self):
+        self.shape_counts = {"heart": 0, "rectangle": 0, "circle": 0, "total": 0}
+
+        # ตารางสถานะด้านล่าง (ค่าเริ่มต้น)
+        self.defect_data = [
+            ("รอยแตก", "ยังไม่พบ", "green"),
+            ("รูเข็ม", "ยังไม่พบ", "green"),
+        ]
+        self.status_labels = {}
+        # >>> ปรับคำแปล defect EN -> TH ตามที่ขอ <<<
+        self.defect_th_map = {"crack": "รอยแตก", "hole": "รูเข็ม"}
+        # Keep default statuses for resetting per plate
+        self._defect_defaults = {d: (s, c) for d, s, c in self.defect_data}
+        # Latched defect counts per plate (hold counts until plate changes)
+        self._latched_defect_counts = {"crack": 0, "hole": 0}
+
+        self.is_collecting_data = False
+        self.camera_running = False
+        self.cap = None
+
+        # session & export
+        self.session_rows = []
+        self.session_meta = {}
+        self.plate_id_counter = 1
+        self.lot_id = self.generate_lot_id()
+        self.lbl_lot = None
+
+        # Path พื้นฐานและโฟลเดอร์บันทึก
+        self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        self.save_root = os.path.join(self.BASE_DIR, "savefile")
+        os.makedirs(self.save_root, exist_ok=True)
+
+        # ---------- YOLO / Detection ----------
+        self.MODEL_PATH = os.path.join(self.BASE_DIR, "best.pt")
+        self.model = None
+        self.imgsz = 896
+        self.conf_thr = 0.27
+        self.iou_thr  = 0.65
+
+        # กลุ่มคลาส
+        self.shape_classes  = {"circle_leaf_plate", "heart_shaped_leaf_plate", "rectangular_leaf_plate"}
+        self.defect_classes = {"crack", "hole"}
+        self.shape_map = {
+            "heart_shaped_leaf_plate": "heart",
+            "rectangular_leaf_plate": "rectangle",
+            "circle_leaf_plate": "circle",
+        }
+        # Display names for shapes in Thai
+        self.shape_display_map = {
+            "heart": "หัวใจ",
+            "rectangle": "สี่เหลี่ยมผืนผ้า",
+            "circle": "วงกลม",
+        }
+
+        # โฟลเดอร์รูป Annotated
+        self.captures_dir = os.path.join(self.BASE_DIR, "captures")
+        os.makedirs(self.captures_dir, exist_ok=True)
+        self.save_cooldown_ms = 1200
+        self._last_save_ms = 0
+
+        # ไฟล์ CSV/JSON อัตโนมัติของ "รอบนี้"
+        self._auto_csv_path = None
+        self._auto_json_path = None
+        self._session_stamp = None
+
+        # ---------- Firebase ----------
+        self.firebase_base = "https://leaf-plate-defect-detec-w-cnn-default-rtdb.asia-southeast1.firebasedatabase.app"
+        self.firebase_session_key = None
+        self._fb_ready = False  # Admin SDK พร้อมหรือยัง
+
+        # label บนการ์ดนับรูปทรง
+        self.lbl_heart = None
+        self.lbl_rect  = None
+        self.lbl_circle= None
+        # Plate gating state
+        self.gate_has_plate = False
+        self.gate_has_counted = False
+        self.gate_present_frames = 0
+        self.gate_absent_frames = 0
+        self.gate_present_thresh = 5
+        self.gate_absent_thresh = 10
+
+        # Plate status label placeholder
+        self.lbl_plate_status = None
+
+    # -----------------------------
+    # Helpers for date/lot/defects
+    # -----------------------------
+    def generate_lot_id(self):
+        return "PTP" + datetime.now().strftime("%y%m%d") + "_01"
+
+    def thai_date(self, dt: datetime):
+        return dt.strftime(f"%d/%m/{dt.year + 543}")
+
+    def title_date(self, dt: datetime):
+        return dt.strftime("%d/%m/%y")
+
+    # -----------------------------
+    # Firebase Admin helpers
+    # -----------------------------
+    def _fb_init(self):
+        """Init Firebase Admin ด้วย service account 'serviceAccountKey.json' หนึ่งครั้ง"""
+        if self._fb_ready:
+            return
+        try:
+            cred_path = os.path.join(self.BASE_DIR, "serviceAccountKey.json")  # เปลี่ยนชื่อไฟล์
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred, {"databaseURL": self.firebase_base})
+            self._fb_ready = True
+        except Exception as e:
+            print(f"[Firebase] Admin init failed, fallback to REST. reason={e}")
+            self._fb_ready = False
+
+    def _firebase_post(self, path, obj):
+        """POST (push) : Admin SDK ก่อน, ไม่งั้น fallback REST"""
+        # เพิ่ม meta เหมือน mock_data.py
+        payload = {
+            **obj,
+            "_meta": {
+                "source": "python-admin",
+                "pushed_at": datetime.now(timezone.utc).isoformat(),
+                "server_id": str(uuid.uuid4())
+            }
+        }
+        try:
+            self._fb_init()
+            if self._fb_ready:
+                ref = db.reference(path)
+                ref.push(payload)
+                return
+        except Exception as e:
+            print(f"[Firebase] Admin push failed, fallback to REST. reason={e}")
+
+        # --- Fallback: REST ---
+        try:
+            url = f"{self.firebase_base}/{path}.json"
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except Exception as e:
+            print(f"[Firebase] REST POST error: {e}")
+
+    def _firebase_put(self, path, obj):
+        """PUT (set) : Admin SDK ก่อน, ไม่งั้น fallback REST"""
+        try:
+            self._fb_init()
+            if self._fb_ready:
+                ref = db.reference(path)
+                ref.set(obj)
+                return
+        except Exception as e:
+            print(f"[Firebase] Admin set failed, fallback to REST. reason={e}")
+
+        # --- Fallback: REST ---
+        try:
+            url = f"{self.firebase_base}/{path}.json"
+            data = json.dumps(obj).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="PUT")
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except Exception as e:
+            print(f"[Firebase] REST PUT error: {e}")
+
+    # -----------------------------
+    # App / Camera / Model
+    # -----------------------------
+    def setup_app(self):
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
+        self.app = ctk.CTk()
+        # Measure screen and size the app to full screen on Mac
+        try:
+            self.app.update_idletasks()
+        except Exception:
+            pass
+        sw = self.app.winfo_screenwidth()
+        sh = self.app.winfo_screenheight()
+        self.W, self.H = sw, sh
+        self.set_layout_constants()
+        self.app.title("Leaf Plate Defect Detection - Full HD")
+        self.app.geometry(f"{self.W}x{self.H}+0+0")
+        self.app.resizable(False, False)
+        self.app.configure(fg_color="#ffffff")
+        self.app.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def setup_camera(self):
+        if sys.platform.startswith("win"):
+            backend = cv2.CAP_DSHOW
+        elif sys.platform == "darwin":
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = cv2.CAP_V4L2
+
+        self.cap = cv2.VideoCapture(0, backend)
+        if not self.cap or not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(0)
+        if not self.cap or not self.cap.isOpened():
+            print("Cannot open camera"); self.cap = None; return
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    def setup_model(self):
+        try:
+            self.model = YOLO(self.MODEL_PATH)
+        except Exception as e:
+            messagebox.showerror("Model Error", f"โหลดโมเดลไม่สำเร็จ:\n{e}")
+            self.model = None
+
+    # -----------------------------
+    # UI
+    # -----------------------------
+    def create_widgets(self):
+        self.create_header()
+        self.create_main_content()
+
+    def create_header(self):
+        header_frame = ctk.CTkFrame(
+            self.app, width=self.header_w, height=self.HEADER_H,
+            fg_color="#1a2a3a", corner_radius=10
+        )
+        header_frame.place(x=self.M, y=self.HEADER_Y)
+
+        ctk.CTkLabel(
+            header_frame,
+            text="Leaf Plate Defect Detection System",
+            font=self.F(32, True),
+            text_color="white"
+        ).place(x=50, y=28)
+
+        self.header_time_label = ctk.CTkLabel(
+            header_frame,
+            text=datetime.now().strftime("%H:%M:%S"),
+            font=self.F(22, True),
+            text_color="white"
+        )
+        self.header_time_label.place(x=self.header_w - 220, y=15)
+
+        current_date = datetime.now()
+        thai_year = current_date.year + 543
+        date_str = current_date.strftime(f"%d/%m/{thai_year}")
+        self.header_date_label = ctk.CTkLabel(
+            header_frame, text=date_str, font=self.F(18), text_color="white"
+        )
+        self.header_date_label.place(x=self.header_w - 220, y=50)
+
+        self.update_header_time()
+
+    def create_main_content(self):
+        self.create_left_panel()
+        self.create_right_panel()
+        self.create_bottom_panel()
+
+    def create_left_panel(self):
+        left_frame = ctk.CTkFrame(
+            self.app, width=self.left_w, height=self.TOP_H,
+            fg_color="#ffffff", corner_radius=15,
+            border_width=2, border_color="#aed6f1"
+        )
+        left_frame.place(x=self.M, y=self.TOP_Y)
+
+        self.camera_frame = ctk.CTkFrame(
+            left_frame, width=self.cam_w, height=self.cam_h,
+            fg_color="#e0f2f7", corner_radius=10,
+            border_width=1, border_color="#aed6f1"
+        )
+        self.camera_frame.place(x=self.cam_pad, y=self.cam_pad)
+
+        self.camera_label = tk.Label(
+            self.camera_frame, text="Initializing Camera...",
+            font=self.FTK(16), fg="black", bg="#e0f2f7"
+        )
+        self.camera_label.place(x=0, y=0, width=self.cam_w, height=self.cam_h)
+
+        self.create_control_buttons(left_frame)
+
+    def create_control_buttons(self, parent):
+        button_frame_w = self.left_w - 2 * self.cam_pad
+        button_frame = ctk.CTkFrame(parent, width=button_frame_w, height=60, fg_color="transparent")
+        button_frame.place(x=self.cam_pad, y=self.cam_pad + self.cam_h + 15)
+
+        self.toggle_button = ctk.CTkButton(
+            button_frame, width=150, height=45, text="เริ่ม",
+            font=self.F(16, True), text_color="#FFFFFF",
+            fg_color="#3498db", hover_color="#FFD700",
+            command=self.toggle_data_collection
+        )
+        self.toggle_button.place(x=0, y=5)
+
+        export_button = ctk.CTkButton(
+            button_frame, width=150, height=45, text="Export",
+            font=self.F(16, True), text_color="#FFFFFF",
+            fg_color="#50C878", hover_color="#27ad60",
+            command=self.show_export_dialog
+        )
+        export_button.place(x=button_frame_w - 150, y=5)
+
+    def create_right_panel(self):
+        right_x = self.M + self.left_w + self.GAP
+        right_frame = ctk.CTkFrame(
+            self.app, width=self.right_w, height=self.TOP_H,
+            fg_color="#ffffff", corner_radius=15,
+            border_width=2, border_color="#aed6f1"
+        )
+        right_frame.place(x=right_x, y=self.TOP_Y)
+
+        self.create_total_count_card(right_frame)
+        self.create_shape_counts_card(right_frame)
+        self.create_session_info_card(right_frame)
+
+    def create_total_count_card(self, parent):
+        card_w = self.right_w - 40
+        total_card = ctk.CTkFrame(
+            parent, width=card_w, height=150,
+            fg_color="#e0f2f7", corner_radius=10,
+            border_width=2, border_color="#3498db"
+        )
+        total_card.place(x=20, y=20)
+
+        ctk.CTkLabel(
+            total_card, text="นับได้ทั้งหมด",
+            font=self.F(18, True), text_color="#1a2a3a"
+        ).place(x=card_w // 2, y=24, anchor="center")
+
+        self.total_number_label = ctk.CTkLabel(
+            total_card, text=str(self.shape_counts["total"]),
+            font=self.F(56, True), text_color="#e74c3c"
+        )
+        self.total_number_label.place(x=card_w // 2, y=88, anchor="center")
+
+    def create_shape_counts_card(self, parent):
+        card_w = self.right_w - 40
+        shape_card = ctk.CTkFrame(
+            parent, width=card_w, height=200,
+            fg_color="#e0f2f7", corner_radius=10,
+            border_width=2, border_color="#3498db"
+        )
+        shape_card.place(x=20, y=190)
+
+        ctk.CTkLabel(
+            shape_card, text="จานแต่ละรูปแบบ",
+            font=self.F(18, True), text_color="#1a2a3a"
+        ).place(x=card_w // 2, y=20, anchor="center")
+
+        box_w, box_h = 220, 100
+        gap = max(12, (card_w - 3 * box_w) // 4)
+        y0 = 55
+
+        # Heart
+        heart_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
+        heart_frame.place(x=gap, y=y0)
+        ctk.CTkLabel(heart_frame, text="หัวใจ", font=self.F(14, True), text_color="#e74c3c")\
+            .place(x=box_w // 2, y=30, anchor="center")
+        self.lbl_heart = ctk.CTkLabel(heart_frame, text=str(self.shape_counts["heart"]),
+                                      font=self.F(22, True), text_color="#1a2a3a")
+        self.lbl_heart.place(x=box_w // 2, y=70, anchor="center")
+
+        # Rectangle
+        rect_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
+        rect_frame.place(x=gap * 2 + box_w, y=y0)
+        ctk.CTkLabel(rect_frame, text="สี่เหลี่ยมผืนผ้า", font=self.F(14, True), text_color="#3498db")\
+            .place(x=box_w // 2, y=30, anchor="center")
+        self.lbl_rect = ctk.CTkLabel(rect_frame, text=str(self.shape_counts["rectangle"]),
+                                     font=self.F(22, True), text_color="#1a2a3a")
+        self.lbl_rect.place(x=box_w // 2, y=70, anchor="center")
+
+        # Circle
+        circle_frame = ctk.CTkFrame(shape_card, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=8)
+        circle_frame.place(x=gap * 3 + box_w * 2, y=y0)
+        ctk.CTkLabel(circle_frame, text="วงกลม", font=self.F(14, True), text_color="#199129")\
+            .place(x=box_w // 2, y=30, anchor="center")
+        self.lbl_circle = ctk.CTkLabel(circle_frame, text=str(self.shape_counts["circle"]),
+                                       font=self.F(22, True), text_color="#1a2a3a")
+        self.lbl_circle.place(x=box_w // 2, y=70, anchor="center")
+
+    def create_session_info_card(self, parent):
+        card_w = self.right_w - 40
+        session_card = ctk.CTkFrame(
+            parent, width=card_w, height=150,
+            fg_color="#ffffff", corner_radius=10,
+            border_width=2, border_color="#e74c3c"
+        )
+        session_card.place(x=20, y=400)
+
+        ctk.CTkLabel(
+            session_card, text="Current Session Info",
+            font=self.F(18, True), text_color="#1a2a3a"
+        ).place(x=card_w // 2, y=18, anchor="center")
+
+        self.lbl_plate_status = ctk.CTkLabel(session_card, text="ยังไม่ตรวจ",
+                                             font=self.F(16, True), text_color="#e74c3c")
+        self.lbl_plate_status.place(x=40, y=50)
+
+        self.lbl_plate_no = ctk.CTkLabel(session_card, text="จานที่ : -",
+                     font=self.F(15), text_color="#1a2a3a")
+        self.lbl_plate_no.place(x=40, y=78)
+
+        self.lbl_lot = ctk.CTkLabel(session_card, text=f"รหัสล็อต : {self.lot_id}",
+                     font=self.F(15), text_color="#1a2a3a")
+        self.lbl_lot.place(x=40, y=104)
+
+    # Bottom
+    def create_bottom_panel(self,):
+        bottom_frame = ctk.CTkFrame(
+            self.app, width=self.bottom_w, height=self.BOTTOM_H,
+            fg_color="#ffffff", corner_radius=15,
+            border_width=2, border_color="#aed6f1"
+        )
+        bottom_frame.place(x=self.M, y=self.BOTTOM_Y)
+        self.create_defect_table(bottom_frame)
+
+    def create_defect_table(self, parent):
+        table_w = self.bottom_w - 40
+        table_h = self.BOTTOM_H - 40
+        table_frame = ctk.CTkFrame(parent, width=table_w, height=table_h,
+                                   fg_color="#ffffff", corner_radius=10)
+        table_frame.place(x=20, y=20)
+
+        header_frame = ctk.CTkFrame(table_frame, width=table_w - 10, height=44,
+                                    fg_color="#1a2a3a", corner_radius=8)
+        header_frame.place(x=5, y=5)
+
+        col1_x = int((table_w - 10) * 0.32)
+        col2_x = int((table_w - 10) * 0.76)
+
+        ctk.CTkLabel(header_frame, text="Defect Type", font=self.F(16, True),
+                     text_color="white").place(x=col1_x, y=22, anchor="center")
+        ctk.CTkLabel(header_frame, text="Detection Status", font=self.F(16, True),
+                     text_color="white").place(x=col2_x, y=22, anchor="center")
+
+        row_start_y = 55
+        row_h = 36
+        for i, (defect, status, color) in enumerate(self.defect_data):
+            row_y = row_start_y + i * row_h
+            row_color = "#ffffff" if i % 2 == 0 else "#e0f2f7"
+            row_frame = ctk.CTkFrame(table_frame, width=table_w - 10, height=row_h,
+                                     fg_color=row_color, corner_radius=0)
+            row_frame.place(x=5, y=row_y)
+
+            ctk.CTkLabel(row_frame, text=defect, font=self.F(15),
+                         text_color="#1a2a3a").place(x=col1_x, y=row_h // 2, anchor="center")
+
+            status_color = "#199129" if color == "green" else "#e74c3c"
+            lbl = ctk.CTkLabel(row_frame, text=status, font=self.F(15, True),
+                               text_color=status_color)
+            lbl.place(x=col2_x, y=row_h // 2, anchor="center")
+
+            self.status_labels[defect] = lbl
+
+    # ----------------- Export helpers (UTF-8 BOM + Excel Safe) -----------------
+    def _excel_safe(self, s: str) -> str:
+        if s is None:
+            return ""
+        s = str(s).replace("\n", "\r\n")
+        if s and s[0] in ("=", "+", "-", "@"):
+            s = "'" + s
+        return s
+
+    def _unique_filename(self, base_path, stem, extension):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"{stem}_{ts}{extension}"
+        full = os.path.join(base_path, fname)
+        i = 2
+        while os.path.exists(full):
+            fname = f"{stem}_{ts}_{i}{extension}"
+            full = os.path.join(base_path, fname)
+            i += 1
+        return full
+
+    # >>> ปรับหัวตารางและข้อมูลให้มีคอลัมน์ "รูปทรงจาน" <<<
+    def _write_csv(self, directory) -> str:
+        csv_path = self._unique_filename(directory, "Report", ".csv")
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([self._excel_safe(f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}")])
+            w.writerow(["วันที่", "เวลา", "Plate ID", "Lot ID", "รูปทรงจาน", "ตำหนิที่พบ", "หมายเหตุ"])
+            for r in self.session_rows:
+                defects_for_csv = self._excel_safe(r["defects"])
+                w.writerow([
+                    r["date"], r["time"], r["plate_id"], r["lot_id"],
+                    r.get("shape", "-"), defects_for_csv, self._excel_safe(r["note"])
+                ])
+        return csv_path
+
+    def _write_json(self, directory) -> str:
+        json_path = self._unique_filename(directory, "Report", ".json")
+        payload = {
+            "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}",
+            "lot_id": self.lot_id,
+            "session": {
+                "start_time": self.session_meta.get("start_time"),
+                "end_time": datetime.now().strftime("%H:%M:%S")
+            },
+            "records": self.session_rows
+        }
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(payload, jf, ensure_ascii=False, indent=2)
+        return json_path
+
+    # ---------- (คงเมนู Export เดิม) ----------
+    def export_session_csv_and_json(self, directory):
+        if not self.session_rows:
+            messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
+            return
+        csv_path = self._write_csv(directory)
+        json_path = self._write_json(directory)
+        messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}\n{os.path.basename(json_path)}")
+        self._reset_all_and_next_lot()
+
+    def show_export_dialog(self):
+        dialog = ctk.CTkToplevel(self.app)
+        dialog.title("Export Options")
+        dialog.geometry("320x220")
+        dialog.resizable(False, False)
+        dialog.transient(self.app); dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Choose Export Format", font=self.F(16, True))\
+            .place(x=160, y=30, anchor="center")
+
+        ctk.CTkButton(
+            dialog, width=220, height=38, text="Export to CSV", font=self.F(12, True),
+            text_color="#FFFFFF", fg_color="#50C878", hover_color="#27ad60",
+            command=lambda: self.save_to_csv(dialog)
+        ).place(x=160, y=80, anchor="center")
+
+        ctk.CTkButton(
+            dialog, width=220, height=38, text="Export to JSON", font=self.F(12, True),
+            text_color="#FFFFFF", fg_color="#f1c40f", hover_color="#d4ac0d",
+            command=lambda: self.save_to_json(dialog)
+        ).place(x=160, y=125, anchor="center")
+
+        ctk.CTkButton(
+            dialog, width=220, height=38, text="Export Both", font=self.F(12, True),
+            text_color="#FFFFFF", fg_color="#3498db", hover_color="#2980b9",
+            command=lambda: self.save_collected_to_csv_and_json(dialog)
+        ).place(x=160, y=170, anchor="center")
+
+    def save_to_csv(self, dialog):
+        if not self.session_rows:
+            messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
+            return
+        directory = filedialog.askdirectory(title="เลือกโฟลเดอร์สำหรับบันทึก CSV")
+        if directory:
+            csv_path = self._write_csv(directory)
+            messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}")
+            dialog.destroy()
+            self._reset_all_and_next_lot()
+
+    def save_to_json(self, dialog):
+        if not self.session_rows:
+            messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
+            return
+        directory = filedialog.askdirectory(title="เลือกโฟลเดอร์สำหรับบันทึก JSON")
+        if directory:
+            json_path = self._write_json(directory)
+            messagebox.showinfo("Success", f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(json_path)}")
+            dialog.destroy()
+            self._reset_all_and_next_lot()
+
+    def save_collected_to_csv_and_json(self, dialog):
+        if not self.session_rows:
+            messagebox.showwarning("Warning", "ยังไม่มีข้อมูลสำหรับบันทึก")
+            return
+        directory = filedialog.askdirectory(title="เลือกโฟลเดอร์สำหรับบันทึกไฟล์รายงาน")
+        if directory:
+            csv_path = self._write_csv(directory)
+            json_path = self._write_json(directory)
+            messagebox.showinfo(
+                "Success",
+                f"บันทึกไฟล์เรียบร้อย\n{os.path.basename(csv_path)}\n{os.path.basename(json_path)}"
+            )
+            dialog.destroy()
+            self._reset_all_and_next_lot()
+
+    # ----------------- Auto-save (CSV/JSON in ./savefile) + Firebase -----------------
+    def _ensure_session_files(self):
+        """สร้างไฟล์ CSV/JSON ของ 'รอบนี้' เมื่อมีรายการแรก"""
+        if self._auto_csv_path and self._auto_json_path:
+            return
+        self._session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._auto_csv_path  = os.path.join(self.save_root, f"Report_{self._session_stamp}.csv")
+        self._auto_json_path = os.path.join(self.save_root, f"Report_{self._session_stamp}.json")
+
+        with open(self._auto_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([self._excel_safe(f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}")])
+            # >>> เพิ่มหัวคอลัมน์ "รูปทรงจาน" <<<
+            w.writerow(["วันที่", "เวลา", "Plate ID", "Lot ID", "รูปทรงจาน", "ตำหนิที่พบ", "หมายเหตุ"])
+
+        self.session_meta.setdefault("start_time", datetime.now().strftime("%H:%M:%S"))
+
+        self.firebase_session_key = self._session_stamp  # ใช้ stamp เป็นชื่อ session
+
+        self._write_json_to_path(self._auto_json_path)
+
+    def _append_csv_row_to_path(self, row):
+        with open(self._auto_csv_path, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            defects_for_csv = self._excel_safe(row["defects"])
+            w.writerow([
+                row["date"], row["time"], row["plate_id"], row["lot_id"],
+                row.get("shape", "-"), defects_for_csv, self._excel_safe(row["note"])
+            ])
+
+    def _write_json_to_path(self, path):
+        payload = {
+            "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}",
+            "lot_id": self.lot_id,
+            "session": {
+                "start_time": self.session_meta.get("start_time"),
+                "end_time": datetime.now().strftime("%H:%M:%S")
+            },
+            "records": self.session_rows
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as jf:
+                json.dump(payload, jf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Write JSON error: {e}")
+
+    def _append_csv_json_and_firebase(self, row):
+        """เรียกทุกครั้งที่เจอ => append CSV, update JSON, ส่ง Firebase"""
+        self._ensure_session_files()
+
+        # append CSV
+        self._append_csv_row_to_path(row)
+
+        # update JSON (เขียนใหม่ทั้งไฟล์จาก self.session_rows)
+        self._write_json_to_path(self._auto_json_path)
+
+        # อัปเดต meta session (PUT)
+        meta = {
+            "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}",
+            "lot_id": self.lot_id,
+            "session": {
+                "start_time": self.session_meta.get("start_time"),
+                "end_time": datetime.now().strftime("%H:%M:%S")
+            }
+        }
+        self._firebase_put(f"sessions/{self.firebase_session_key}/meta", meta)
+
+        # โพสต์แถวล่าสุดเข้า Firebase (POST)
+        self._firebase_post(f"sessions/{self.firebase_session_key}/records", row)
+
+    # ----------------- Lot/Reset helpers -----------------
+    def _update_lot_label(self):
+        try:
+            if self.lbl_lot is not None:
+                self.lbl_lot.configure(text=f"รหัสล็อต : {self.lot_id}")
+        except Exception:
+            pass
+
+    def _increment_lot_id(self):
+        try:
+            now_date_short = datetime.now().strftime("%y%m%d")
+            base = f"PTP{now_date_short}"
+            seq = 1
+            if isinstance(self.lot_id, str) and "_" in self.lot_id and self.lot_id.startswith("PTP"):
+                old_base, old_seq = self.lot_id.split("_", 1)
+                if old_base.endswith(now_date_short):
+                    try:
+                        seq = int(old_seq) + 1
+                    except Exception:
+                        seq = 1
+            self.lot_id = f"{base}_{seq:02d}"
+        except Exception:
+            # fallback
+            self.lot_id = self.generate_lot_id()
+        self._update_lot_label()
+
+    def _reset_all_and_next_lot(self):
+        # Reset counters
+        self.shape_counts = {"heart": 0, "rectangle": 0, "circle": 0, "total": 0}
+        try:
+            if self.lbl_heart:  self.lbl_heart.configure(text="0")
+            if self.lbl_rect:   self.lbl_rect.configure(text="0")
+            if self.lbl_circle: self.lbl_circle.configure(text="0")
+            self.total_number_label.configure(text="0")
+        except Exception:
+            pass
+
+        # Reset session data
+        self.session_rows = []
+        self.session_meta = {}
+        self.plate_id_counter = 1
+        if hasattr(self, "lbl_plate_no") and self.lbl_plate_no is not None:
+            try:
+                self.lbl_plate_no.configure(text="จานที่ : -")
+            except Exception:
+                pass
+
+        # Reset autosave / Firebase session
+        self._auto_csv_path = None
+        self._auto_json_path = None
+        self._session_stamp = None
+        self.firebase_session_key = None
+
+        # Reset gating and statuses
+        self.gate_has_plate = False
+        self.gate_has_counted = False
+        self.gate_present_frames = 0
+        self.gate_absent_frames = 0
+        self._set_plate_status("pending")
+        try:
+            self._reset_defect_table()
+            self._render_latched_defect_counts()
+        except Exception:
+            pass
+
+        # Move to next lot id
+        self._increment_lot_id()
+
+    # ----------------- Detection helpers -----------------
+    def _update_shape_counters(self, shapes_found: set):
+        if not shapes_found:
+            return
+        for shp in shapes_found:
+            if shp in self.shape_counts:
+                self.shape_counts[shp] += 1
+                self.shape_counts["total"] += 1
+
+        if self.lbl_heart:  self.lbl_heart.configure(text=str(self.shape_counts["heart"]))
+        if self.lbl_rect:   self.lbl_rect.configure(text=str(self.shape_counts["rectangle"]))
+        if self.lbl_circle: self.lbl_circle.configure(text=str(self.shape_counts["circle"]))
+        self.total_number_label.configure(text=str(self.shape_counts["total"]))
+
+    def _update_defect_status_ui(self, defect_names: set):
+        for en_name in defect_names:
+            th_name = self.defect_th_map.get(en_name)
+            if not th_name:
+                continue
+            lbl = self.status_labels.get(th_name)
+            if lbl:
+                lbl.configure(text="พบตำหนิ", text_color="#e74c3c")
+
+    def _update_defect_counts_ui(self, defect_counts: dict):
+        """Update bottom table with numeric counts per defect (red when >0, else green 'ยังไม่พบ')."""
+        for en_name, th_name in self.defect_th_map.items():
+            lbl = self.status_labels.get(th_name)
+            if not lbl:
+                continue
+            cnt = int(defect_counts.get(en_name, 0))
+            if cnt > 0:
+                lbl.configure(text=str(cnt), text_color="#e74c3c")
+            else:
+                default_status, default_color = self._defect_defaults.get(th_name, ("ยังไม่พบ", "green"))
+                status_color = "#199129" if default_color == "green" else "#e74c3c"
+                lbl.configure(text=default_status, text_color=status_color)
+
+    def _reset_defect_table(self):
+        # Reset latched counts
+        for k in list(self._latched_defect_counts.keys()):
+            self._latched_defect_counts[k] = 0
+        # Render defaults
+        for defect, (status, color) in self._defect_defaults.items():
+            lbl = self.status_labels.get(defect)
+            if lbl:
+                status_color = "#199129" if color == "green" else "#e74c3c"
+                lbl.configure(text=status, text_color=status_color)
+
+    def _render_latched_defect_counts(self):
+        for en_name, th_name in self.defect_th_map.items():
+            lbl = self.status_labels.get(th_name)
+            if not lbl:
+                continue
+            cnt = int(self._latched_defect_counts.get(en_name, 0))
+            if cnt > 0:
+                lbl.configure(text=str(cnt), text_color="#e74c3c")
+            else:
+                default_status, default_color = self._defect_defaults.get(th_name, ("ยังไม่พบ", "green"))
+                status_color = "#199129" if default_color == "green" else "#e74c3c"
+                lbl.configure(text=default_status, text_color=status_color)
+
+    def _set_plate_status(self, mode: str):
+        if not self.lbl_plate_status:
+            return
+        if mode == "pending":
+            self.lbl_plate_status.configure(text="ยังไม่ตรวจ", text_color="#e74c3c")
+        elif mode == "counted":
+            self.lbl_plate_status.configure(text="ตรวจแล้ว", text_color="#199129")
+
+    def _save_detection_record(self, annotated_bgr, defect_names: set, shapes_found: set):
+        now = datetime.now()
+        ts  = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+        # บันทึกรูป
+        img_path = os.path.join(self.captures_dir, f"detect_{ts}.jpg")
+        try:
+            cv2.imwrite(img_path, annotated_bgr)
+        except Exception as e:
+            print(f"Save image error: {e}")
+
+        # แปลง defect EN->TH และเอาเครื่องหมาย • ออก
+        defects_th = [self.defect_th_map.get(d, d) for d in sorted(defect_names)]
+        defects_text = " - " if not defects_th else " / ".join(defects_th)
+
+        # สรุปรูปทรง (กรณีพบหลายรูปทรง ให้รวมด้วย '/'), แสดงเป็นภาษาไทย
+        if not shapes_found:
+            shape_text = "-"
+        else:
+            thai_shapes = [self.shape_display_map.get(s, s) for s in sorted(shapes_found)]
+            shape_text = " / ".join(thai_shapes)
+
+        # สร้างแถวข้อมูล (เพิ่มคีย์ shape)
+        row = {
+            "date": self.thai_date(now),
+            "time": now.strftime("%H:%M:%S"),
+            "plate_id": self.plate_id_counter,
+            "lot_id": self.lot_id,
+            "shape": shape_text,
+            "defects": defects_text.strip(),
+            "note": ""
+        }
+        self.plate_id_counter += 1
+        self.session_rows.append(row)
+
+        return row
+
+    def _annotate_and_summarize(self, frame_bgr, res):
+        annotated = frame_bgr.copy()
+        shapes_found, defect_names = set(), set()
+        defect_counts = {}
+
+        if not hasattr(res, "boxes") or res.boxes is None:
+            return annotated, shapes_found, defect_counts, defect_names
+
+        names = self.model.names
+        boxes = res.boxes
+
+        xyxy = boxes.xyxy.cpu().numpy().astype(int)
+        clss = boxes.cls.cpu().numpy().astype(int)
+        conf = boxes.conf.cpu().numpy()
+
+        for (x1, y1, x2, y2), c, p in zip(xyxy, clss, conf):
+            label = names.get(int(c), str(c))
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv2.putText(annotated, f"{label} {p:.2f}", (x1, max(20, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 255), 2, cv2.LINE_AA)
+
+            if label in self.shape_classes:
+                shapes_found.add(self.shape_map[label])
+            if label in self.defect_classes:
+                defect_names.add(label)
+                defect_counts[label] = defect_counts.get(label, 0) + 1
+
+        return annotated, shapes_found, defect_counts, defect_names
+
+    # ----------------- Camera update -----------------
+    def start_camera(self):
+        if self.cap:
+            self.camera_running = True
+            self.update_camera()
+
+    def stop_camera(self):
+        self.camera_running = False
+        if self.cap:
+            self.cap.release(); self.cap = None
+
+    def update_camera(self):
+        if not self.camera_running or not self.cap:
+            return
+        ret, frame = self.cap.read()
+        if not ret:
+            self.app.after(30, self.update_camera)
+            return
+
+        frame_resized = cv2.resize(frame, (self.cam_w, self.cam_h))
+
+        if self.is_collecting_data and self.model is not None:
+            try:
+                results = self.model.predict(
+                    source=frame_resized,
+                    imgsz=self.imgsz,
+                    conf=self.conf_thr,
+                    iou=self.iou_thr,
+                    verbose=False
+                )
+                res = results[0]
+                annotated, shapes_found, defect_counts, defect_names = self._annotate_and_summarize(frame_resized, res)
+                frame_to_show = annotated
+
+                # Single-count gating per plate
+                plate_detected = (len(shapes_found) > 0) or (len(defect_names) > 0)
+                # Update latched counts (monotonic per plate) and render
+                if plate_detected:
+                    for k, v in defect_counts.items():
+                        try:
+                            iv = int(v)
+                        except Exception:
+                            iv = 0
+                        self._latched_defect_counts[k] = max(self._latched_defect_counts.get(k, 0), iv)
+                    self._render_latched_defect_counts()
+                if plate_detected:
+                    self.gate_present_frames += 1
+                    self.gate_absent_frames = 0
+                else:
+                    self.gate_absent_frames += 1
+                    self.gate_present_frames = 0
+
+                # New stable plate appears
+                if (not self.gate_has_plate) and plate_detected and self.gate_present_frames >= self.gate_present_thresh:
+                    self.gate_has_plate = True
+                    self.gate_has_counted = False
+                    self._set_plate_status("pending")
+                    # Reset bottom defect table for the new plate
+                    self._reset_defect_table()
+                    self._render_latched_defect_counts()
+
+                # Count once per plate
+                if self.gate_has_plate and (not self.gate_has_counted) and self.gate_present_frames >= self.gate_present_thresh:
+                    self._update_shape_counters(shapes_found)
+                    # If only defects detected (no shapes), still increment total count
+                    if (not shapes_found) and (len(defect_names) > 0):
+                        self.shape_counts["total"] += 1
+                        self.total_number_label.configure(text=str(self.shape_counts["total"]))
+                    row = self._save_detection_record(annotated, defect_names, shapes_found)
+                    # เซฟ CSV/JSON อัตโนมัติ + ส่ง Firebase
+                    self._append_csv_json_and_firebase(row)
+                    self._set_plate_status("counted")
+                    self.gate_has_counted = True
+                    self._last_save_ms = time.time() * 1000.0
+                    # Update current plate number label
+                    if hasattr(self, "lbl_plate_no") and self.lbl_plate_no is not None:
+                        self.lbl_plate_no.configure(text=f"จานที่ : {row['plate_id']}")
+
+                # Plate removed -> reset gate
+                if self.gate_has_plate and self.gate_absent_frames >= self.gate_absent_thresh:
+                    self.gate_has_plate = False
+                    self.gate_has_counted = False
+                    self._set_plate_status("pending")
+
+            except Exception as e:
+                print(f"Inference error: {e}")
+                frame_to_show = frame_resized
+        else:
+            frame_to_show = frame_resized
+
+        try:
+            frame_rgb = cv2.cvtColor(frame_to_show, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            imgtk = ImageTk.PhotoImage(pil_img)
+            self.camera_label.configure(image=imgtk, text="")
+            self.camera_label.image = imgtk
+        except Exception as e:
+            print(f"Camera display error: {e}")
+
+        self.app.after(30, self.update_camera)
+
+    # ----------------- Stop confirm popup -----------------
+    def stop_and_finalize(self):
+        """หยุดการตรวจ + export อัตโนมัติลง ./savefile/ + อัปเดต meta ไป Firebase"""
+        self.is_collecting_data = False
+        try:
+            self.toggle_button.configure(text="เริ่ม", fg_color="#3498db", hover_color="#2980b9")
+        except Exception:
+            pass
+
+        if self.session_rows:
+            try:
+                self._write_csv(self.save_root)
+                self._write_json(self.save_root)
+                # After auto-export at stop, reset and move to next lot
+                self._reset_all_and_next_lot()
+                try:
+                    messagebox.showinfo("Reset", f"รีเซ็ตข้อมูลเรียบร้อย\nรหัสล็อตใหม่: {self.lot_id}")
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[Export at stop] failed: {e}")
+
+        if self._session_stamp:
+            meta = {
+                "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self.title_date(datetime.now())}",
+                "lot_id": self.lot_id,
+                "session": {
+                    "start_time": self.session_meta.get("start_time"),
+                    "end_time": datetime.now().strftime("%H:%M:%S")
+                }
+            }
+            self._firebase_put(f"sessions/{self.firebase_session_key}/meta", meta)
+        # Reset plate status when finalized
+        self._set_plate_status("pending")
+
+    def show_stop_confirm_dialog(self):
+        """แสดงป๊อปอัปยืนยันการหยุด: Submit (ยืนยัน) / ตรวจต่อ"""
+        dlg = ctk.CTkToplevel(self.app)
+        dlg.title("ยืนยันการหยุด")
+        dlg.geometry("380x190")
+        dlg.resizable(False, False)
+        dlg.transient(self.app)
+        dlg.grab_set()
+
+        # จัดกลางหน้าจอหลัก
+        try:
+            self.app.update_idletasks()
+            ax, ay = self.app.winfo_x(), self.app.winfo_y()
+            aw, ah = self.app.winfo_width(), self.app.winfo_height()
+            dw, dh = 380, 190
+            dlg.geometry(f"{dw}x{dh}+{ax + (aw-dw)//2}+{ay + (ah-dh)//2}")
+        except Exception:
+            pass
+
+        ctk.CTkLabel(dlg,
+            text="คุณยืนยันจะหยุดตรวจและบันทึกรายงานหรือไม่?",
+            font=self.F(16, True)
+        ).place(x=190, y=55, anchor="center")
+
+        ctk.CTkButton(
+            dlg, width=140, height=40, text="Submit (ยืนยัน)",
+            font=self.F(14, True), fg_color="#27ae60", hover_color="#1e8449",
+            command=lambda: self._handle_stop_submit(dlg)
+        ).place(x=40, y=110)
+
+        ctk.CTkButton(
+            dlg, width=140, height=40, text="ตรวจต่อ",
+            font=self.F(14, True), fg_color="#95a5a6", hover_color="#7f8c8d",
+            command=dlg.destroy
+        ).place(x=200, y=110)
+
+        dlg.bind("<Return>", lambda e: self._handle_stop_submit(dlg))
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    def _handle_stop_submit(self, dlg):
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        self.stop_and_finalize()
+
+    # ----------------- Events -----------------
+    def toggle_data_collection(self):
+        if not self.is_collecting_data:
+            if self.model is None:
+                messagebox.showerror("Model Error", "ยังโหลดโมเดลไม่สำเร็จ")
+                return
+            self.is_collecting_data = True
+            self.session_meta.setdefault("start_time", datetime.now().strftime("%H:%M:%S"))
+            self.toggle_button.configure(text="หยุด", fg_color="#e74c3c", hover_color="#c0392b")
+            # Reset gating state when starting
+            self.gate_has_plate = False
+            self.gate_has_counted = False
+            self.gate_present_frames = 0
+            self.gate_absent_frames = 0
+            self._set_plate_status("pending")
+            # Reset defect table and show current counted plate number
+            try:
+                self._reset_defect_table()
+                if hasattr(self, "lbl_plate_no") and self.lbl_plate_no is not None:
+                    self.lbl_plate_no.configure(text=f"จานที่ : {self.plate_id_counter - 1}")
+            except Exception:
+                pass
+        else:
+            # แสดงป๊อปอัปยืนยันแทนที่จะหยุดทันที
+            self.show_stop_confirm_dialog()
+
+    def update_header_time(self):
+        self.header_time_label.configure(text=datetime.now().strftime("%H:%M:%S"))
+        self.app.after(1000, self.update_header_time)
+
+    def on_closing(self):
+        if self.is_collecting_data:
+            if not messagebox.askyesno("ออกจากโปรแกรม", "กำลังตรวจจับอยู่ ต้องการออกทันทีหรือไม่?"):
+                return
+            # หยุด + export + อัปเดต meta
+            self.stop_and_finalize()
+
+        self.stop_camera()
+        self.app.destroy()
+
+    # ----------------- Run -----------------
+    def run(self):
+        self.app.mainloop()
+
+
+# ----------------- Boot -----------------
+if __name__ == "__main__":
+    app = LeafPlateDetectionApp()
+    app.initialize_data()
+    app.setup_app()
+    app.setup_fonts()
+    app.setup_camera()
+    app.setup_model()
+    app.create_widgets()
+    app.start_camera()
+    app.run()
