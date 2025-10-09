@@ -4,7 +4,7 @@
 # Put your Firebase service account JSON next to this file as: serviceAccountKey.json
 
 import os, sys, time, json, uuid, glob, signal
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timezone
 
 import customtkinter as ctk
 import tkinter as tk
@@ -19,22 +19,22 @@ from ultralytics import YOLO
 
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from openpyxl.utils import get_column_letter
-from collections import Counter, defaultdict
 
-# -------- Emoji Support (optional) --------
+# -------- Emoji Support --------
 try:
     import emojis
     EMOJI_AVAILABLE = True
 except ImportError:
     EMOJI_AVAILABLE = False
+    print("Warning: emojis library not available. Install with: pip install emojis")
 
 try:
-    from colorama import init as colorama_init, Fore, Back, Style
-    colorama_init(autoreset=True)
+    from colorama import init, Fore, Back, Style
+    init(autoreset=True)  # เริ่มต้น colorama สำหรับ Windows
     COLORAMA_AVAILABLE = True
 except ImportError:
     COLORAMA_AVAILABLE = False
+    print("Warning: colorama library not available. Install with: pip install colorama")
 
 # -------- Firebase Admin SDK --------
 import firebase_admin
@@ -42,10 +42,10 @@ from firebase_admin import credentials, db
 
 
 # ================================
-# Excel Viewer (รายวัน)
+# Excel Viewer (dropdown auto-load)
 # ================================
 class ExcelViewerDialog(ctk.CTkToplevel):
-    """Excel viewer/editor (รายวัน): เลือกไฟล์จาก dropdown -> โหลดทันที; ดับเบิลคลิกเพื่อแก้ไข"""
+    """Excel viewer/editor: choose file from dropdown -> load instantly; double-click to edit."""
     def __init__(self, parent, folder, title="Excel Viewer"):
         super().__init__(parent)
         self.parent = parent
@@ -88,8 +88,9 @@ class ExcelViewerDialog(ctk.CTkToplevel):
 
         self.current_path = None
         self.headers = []
-        self.header_row_idx = 1
+        self.header_row_idx = 1  # dynamic (we detect it)
 
+        # Load initial list and open newest
         self._refresh_file_list()
 
     def _refresh_file_list(self):
@@ -128,14 +129,15 @@ class ExcelViewerDialog(ctk.CTkToplevel):
         self._load_excel_to_tree(path)
 
     def _detect_header_row(self, sh):
+        # หาแถวที่หัวคอลัมน์เริ่มต้น (มองหาคำว่า "วันที่")
         for r in range(1, min(sh.max_row, 20) + 1):
             val = sh.cell(row=r, column=1).value
             if isinstance(val, str) and val.strip() == "วันที่":
                 return r
-        return 1
+        return 1  # fallback
 
     def _load_excel_to_tree(self, path):
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb = openpyxl.load_workbook(path)
         sh = wb.active
 
         self.header_row_idx = self._detect_header_row(sh)
@@ -155,6 +157,7 @@ class ExcelViewerDialog(ctk.CTkToplevel):
                 vals += [""] * (len(self.headers) - len(vals))
             elif len(vals) > len(self.headers):
                 vals = vals[:len(self.headers)]
+            # skip trailing empty rows
             if any(v != "" for v in vals):
                 self.tree.insert("", "end", values=vals)
 
@@ -168,7 +171,7 @@ class ExcelViewerDialog(ctk.CTkToplevel):
         if region != "cell":
             return
         row_id = self.tree.identify_row(event.y)
-        col_id = self.tree.identify_column(event.x)
+        col_id = self.tree.identify_column(event.x)  # '#3'
         if not row_id or not col_id:
             return
         col_idx = int(col_id.replace("#", "")) - 1
@@ -203,7 +206,7 @@ class ExcelViewerDialog(ctk.CTkToplevel):
         try:
             wb = openpyxl.load_workbook(self.current_path)
             sh = wb.active
-            excel_row = self.header_row_idx + 1 + self._tree_index_of(row_id)
+            excel_row = self.header_row_idx + 1 + self._tree_index_of(row_id)  # header_row + index + 1
             excel_col = col_idx + 1
             sh.cell(row=excel_row, column=excel_col, value=value)
             wb.save(self.current_path)
@@ -230,214 +233,26 @@ class ExcelViewerDialog(ctk.CTkToplevel):
 
 
 # ================================
-# Excel Viewer (รายสัปดาห์) – แสดงแถบสีให้หัววัน และหัววันห้ามแก้ไข
-# ================================
-class WeeklyExcelViewerDialog(ctk.CTkToplevel):
-    def __init__(self, parent, folder, title="Excel Viewer - Weekly"):
-        super().__init__(parent)
-        self.parent = parent
-        self.folder = folder
-        self.title(title)
-        self.geometry("980x560")
-        self.resizable(True, True)
-        self.grab_set()
-
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=10, pady=(10, 6))
-
-        ctk.CTkLabel(top, text="เลือกไฟล์:", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=(0, 8))
-        self.combo = ttk.Combobox(top, state="readonly", width=48)
-        self.combo.pack(side="left")
-        self.combo.bind("<<ComboboxSelected>>", lambda e: self._load_selected())
-
-        ctk.CTkButton(top, text="รีเฟรช", width=80, command=self._refresh_file_list).pack(side="left", padx=8)
-
-        mid = ctk.CTkFrame(self)
-        mid.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        self.tree = ttk.Treeview(mid, show="headings")
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(mid, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
-
-        # หัววัน: เทาอ่อน อ่านง่าย และล็อกไม่ให้แก้
-        self.tree.tag_configure(
-            "day_header",
-            background="#E6E6E6",
-            foreground="#333333",
-            font=tkfont.Font(family="Arial", size=10, weight="bold")
-        )
-        self.protected_rows = set()
-
-        self.tree.bind("<Double-1>", self._begin_edit)
-
-        bot = ctk.CTkFrame(self, fg_color="transparent")
-        bot.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkButton(bot, text="บันทึกทั้งหมดอีกครั้ง", command=self._save_all).pack(side="right", padx=6)
-        ctk.CTkButton(bot, text="ปิด", command=self.destroy).pack(side="right")
-
-        self.current_path = None
-        self.headers = []
-        self.header_row_idx = 1
-        self.weekday_names = {"วันจันทร์", "วันอังคาร", "วันพุธ", "วันพฤหัสบดี", "วันศุกร์", "วันเสาร์", "วันอาทิตย์"}
-
-        self._refresh_file_list()
-
-    def _refresh_file_list(self):
-        prev = self.combo.get()
-        paths = sorted(
-            glob.glob(os.path.join(self.folder, "Weekly_*.xlsx")),
-            key=lambda p: os.path.getmtime(p),
-            reverse=True,
-        )
-        names = [os.path.basename(p) for p in paths]
-        self.combo["values"] = names
-        if not names:
-            self.combo.set("")
-            self.current_path = None
-            self.tree.delete(*self.tree.get_children())
-            self.title("Excel Viewer - Weekly (ไม่มีไฟล์)")
-            return
-        if prev in names:
-            self.combo.current(names.index(prev))
-        else:
-            self.combo.current(0)
-        self._load_selected()
-
-    def _load_selected(self):
-        name = self.combo.get()
-        if not name:
-            return
-        path = os.path.join(self.folder, name)
-        if not os.path.exists(path):
-            messagebox.showerror("Excel", f"ไม่พบไฟล์: {path}")
-            return
-        self.current_path = path
-        self._load_excel_to_tree(path)
-
-    def _detect_header_row(self, sh):
-        for r in range(1, min(sh.max_row, 30) + 1):
-            v = sh.cell(row=r, column=1).value
-            if isinstance(v, str) and v.strip() == "วันที่":
-                return r
-        return 1
-
-    def _load_excel_to_tree(self, path):
-        wb = openpyxl.load_workbook(path, data_only=True)
-        sh = wb.active
-
-        self.header_row_idx = self._detect_header_row(sh)
-        self.headers = [cell.value if cell.value is not None else "" for cell in sh[self.header_row_idx]]
-        if not self.headers:
-            self.headers = ["วันที่", "รหัสชุด", "จำนวนจานทั้งหมด", "ไม่มีตำหนิ", "มีตำหนิ", "ตำหนิที่พบบ่อยที่สุด", "หมายเหตุ"]
-
-        self.tree.delete(*self.tree.get_children())
-        self.protected_rows.clear()
-        self.tree["columns"] = [str(i) for i in range(len(self.headers))]
-        for i, h in enumerate(self.headers):
-            self.tree.heading(str(i), text=str(h))
-            self.tree.column(str(i), width=150 if i == 0 else 130, anchor="center")
-
-        for r in range(self.header_row_idx + 1, sh.max_row + 1):
-            row_vals = [sh.cell(row=r, column=c).value for c in range(1, len(self.headers) + 1)]
-            row_vals = [("" if v is None else str(v)) for v in row_vals]
-            is_day_header = (row_vals[0] in self.weekday_names) and all(v == "" for v in row_vals[1:])
-            if any(v != "" for v in row_vals):
-                if is_day_header:
-                    iid = self.tree.insert("", "end", values=row_vals, tags=("day_header",))
-                    self.protected_rows.add(iid)
-                else:
-                    self.tree.insert("", "end", values=row_vals)
-
-        wb.close()
-        self.title(f"Excel Viewer - Weekly - {os.path.basename(path)}")
-
-    def _begin_edit(self, event):
-        if not self.current_path:
-            return
-        region = self.tree.identify("region", event.x, event.y)
-        if region != "cell":
-            return
-        row_id = self.tree.identify_row(event.y)
-        col_id = self.tree.identify_column(event.x)
-        if not row_id or not col_id:
-            return
-        if row_id in self.protected_rows:
-            return
-
-        col_idx = int(col_id.replace("#", "")) - 1
-        x, y, w, h = self.tree.bbox(row_id, col_id)
-        cur = self.tree.set(row_id, col_id)
-
-        entry = tk.Entry(self.tree)
-        entry.insert(0, cur)
-        entry.select_range(0, tk.END)
-        entry.focus()
-        entry.place(x=x, y=y, width=w, height=h)
-
-        def commit(_=None):
-            new_val = entry.get()
-            entry.destroy()
-            values = list(self.tree.item(row_id, "values"))
-            values[col_idx] = new_val
-            self.tree.item(row_id, values=values)
-            self._write_back_cell(row_id, col_idx, new_val)
-
-        def cancel(_=None):
-            entry.destroy()
-
-        entry.bind("<Return>", commit)
-        entry.bind("<Escape>", cancel)
-        entry.bind("<FocusOut>", commit)
-
-    def _tree_index_of(self, row_id):
-        return self.tree.get_children().index(row_id)
-
-    def _write_back_cell(self, row_id, col_idx, value):
-        try:
-            wb = openpyxl.load_workbook(self.current_path)
-            sh = wb.active
-            excel_row = self.header_row_idx + 1 + self._tree_index_of(row_id)
-            excel_col = col_idx + 1
-            sh.cell(row=excel_row, column=excel_col, value=value)
-            wb.save(self.current_path)
-            wb.close()
-        except Exception as e:
-            print(f"[Weekly write-back] {e}")
-
-    def _save_all(self):
-        if not self.current_path:
-            return
-        try:
-            wb = openpyxl.load_workbook(self.current_path)
-            sh = wb.active
-            r0 = self.header_row_idx + 1
-            for i, row_id in enumerate(self.tree.get_children(), start=r0):
-                if row_id in self.protected_rows:
-                    continue
-                vals = list(self.tree.item(row_id, "values"))
-                for j, v in enumerate(vals, start=1):
-                    sh.cell(row=i, column=j, value=v)
-            wb.save(self.current_path)
-            wb.close()
-            messagebox.showinfo("Excel", "บันทึกเรียบร้อย")
-        except Exception as e:
-            messagebox.showerror("Excel", f"บันทึกไม่สำเร็จ:\n{e}")
-
-
-# ================================
 # Main App
 # ================================
 class LeafPlateDetectionApp:
+    """
+    Leaf Plate Defect Detection Application
+    - โหลดโมเดล best.pt ข้างไฟล์
+    - ตรวจเจอ => เซฟภาพ + append Excel + update JSON ใน ./savefile/
+      และ push แถวล่าสุดขึ้น Firebase
+    - ปุ่ม “รายงาน” เปิด Excel Viewer/Editor (dropdown auto-load)
+    - ป๊อปอัปยืนยันตอนกดหยุด + ล็อตหมุนอัตโนมัติ
+    """
+
     # ---------------- Fonts ----------------
     def setup_fonts(self):
         self.FONT_FAMILY = "Arial"
-        for name in ("TkDefaultFont", "TkHeadingFont", "TkTextFont", "TkMenuFont",
-                     "TkFixedFont", "TkTooltipFont", "TkCaptionFont",
-                     "TkSmallCaptionFont", "TkIconFont"):
+        for name in (
+            "TkDefaultFont", "TkHeadingFont", "TkTextFont", "TkMenuFont",
+            "TkFixedFont", "TkTooltipFont", "TkCaptionFont",
+            "TkSmallCaptionFont", "TkIconFont"
+        ):
             try:
                 tkfont.nametofont(name).configure(family=self.FONT_FAMILY)
             except tk.TclError:
@@ -450,48 +265,97 @@ class LeafPlateDetectionApp:
         )
 
     def _emoji_font(self, size=36):
+        # ใช้ฟอนต์อีโมจิสีตาม OS
         if sys.platform.startswith("win"):
-            for fam in ["Segoe UI Emoji", "Microsoft YaHei UI", "Segoe UI Symbol", "Apple Color Emoji"]:
+            # ลองใช้ฟอนต์ต่างๆ ที่รองรับ emoji สีใน Windows
+            emoji_fonts = ["Segoe UI Emoji", "Microsoft YaHei UI", "Segoe UI Symbol", "Apple Color Emoji"]
+            for font_name in emoji_fonts:
                 try:
-                    return ctk.CTkFont(family=fam, size=size, weight="bold")
-                except:  # noqa: E722
+                    # ทดสอบว่าฟอนต์ใช้งานได้หรือไม่
+                    test_font = ctk.CTkFont(family=font_name, size=size, weight="bold")
+                    return test_font
+                except:
                     continue
+            # fallback ไปใช้ฟอนต์เริ่มต้น
             return ctk.CTkFont(size=size, weight="bold")
         elif sys.platform == "darwin":
             return ctk.CTkFont(family="Apple Color Emoji", size=size, weight="bold")
         else:
-            for fam in ["Noto Color Emoji", "EmojiOne Color", "Twemoji"]:
+            # Linux - ลองใช้ฟอนต์ต่างๆ
+            emoji_fonts = ["Noto Color Emoji", "Apple Color Emoji", "EmojiOne Color", "Twemoji"]
+            for font_name in emoji_fonts:
                 try:
-                    return ctk.CTkFont(family=fam, size=size, weight="bold")
-                except:  # noqa: E722
+                    test_font = ctk.CTkFont(family=font_name, size=size, weight="bold")
+                    return test_font
+                except:
                     continue
             return ctk.CTkFont(size=size, weight="bold")
 
     def _get_colored_emoji(self, emoji_code, color_code=None):
+        """แปลง emoji code เป็น emoji พร้อมสี"""
         if EMOJI_AVAILABLE:
             try:
-                return emojis.encode(emoji_code)
-            except:  # noqa: E722
+                emoji_char = emojis.encode(emoji_code)
+                return emoji_char
+            except:
                 pass
-        mapping = {
-            ":information_source:": "ℹ️", ":white_check_mark:": "✅", ":warning:": "⚠️",
-            ":cross_mark:": "❌", ":heart:": "❤️"
+        
+        # fallback ไปใช้ Unicode emoji โดยตรง
+        emoji_map = {
+            ":red_circle:": "🔴",
+            ":green_square:": "🟩", 
+            ":blue_circle:": "🔵",
+            ":white_check_mark:": "✅",
+            ":cross_mark:": "❌",
+            ":warning:": "⚠️",
         }
-        return mapping.get(emoji_code, emoji_code)
+        
+        return emoji_map.get(emoji_code, emoji_code)
+
+    def _create_colored_emoji_label(self, parent, emoji_code, size=36, color=None):
+        """สร้าง label ที่แสดง emoji แบบมีสีสัน"""
+        emoji_char = self._get_colored_emoji(emoji_code)
+        emoji_font = self._emoji_font(size)
+        
+        label = ctk.CTkLabel(
+            parent, 
+            text=emoji_char, 
+            font=emoji_font,
+            text_color=color if color else "#222222"
+        )
+        return label
 
     def _print_colored_emoji_message(self, message, emoji_code, color="white"):
+        """พิมพ์ข้อความที่มี emoji แบบมีสีสันใน console"""
         if COLORAMA_AVAILABLE:
+            emoji_char = self._get_colored_emoji(emoji_code)
             color_func = getattr(Fore, color.upper(), Fore.WHITE)
-            print(f"{color_func}{self._get_colored_emoji(emoji_code)} {message}{Style.RESET_ALL}")
+            print(f"{color_func}{emoji_char} {message}{Style.RESET_ALL}")
         else:
-            print(f"{self._get_colored_emoji(emoji_code)} {message}")
+            emoji_char = self._get_colored_emoji(emoji_code)
+            print(f"{emoji_char} {message}")
 
     def _log_with_emoji(self, level, message):
-        emoji_map = {"info": ":information_source:", "success": ":white_check_mark:",
-                     "warning": ":warning:", "error": ":cross_mark:", "debug": ":information_source:"}
-        color_map = {"info": "cyan", "success": "green", "warning": "yellow", "error": "red", "debug": "blue"}
-        self._print_colored_emoji_message(message, emoji_map.get(level, ":information_source:"),
-                                          color_map.get(level, "white"))
+        """บันทึก log พร้อม emoji"""
+        emoji_map = {
+            "info": ":information_source:",
+            "success": ":white_check_mark:",
+            "warning": ":warning:",
+            "error": ":cross_mark:",
+            "debug": ":gear:"
+        }
+        
+        emoji_code = emoji_map.get(level, ":information_source:")
+        color_map = {
+            "info": "cyan",
+            "success": "green", 
+            "warning": "yellow",
+            "error": "red",
+            "debug": "blue"
+        }
+        
+        color = color_map.get(level, "white")
+        self._print_colored_emoji_message(message, emoji_code, color)
 
     # ---------------- Data / Config ----------------
     def initialize_data(self):
@@ -511,18 +375,9 @@ class LeafPlateDetectionApp:
         self.cam_h = 540
         self.cam_w = self.left_w - (self.cam_pad * 2)
 
-        # ----- Button palette (รีสกินปุ่ม) -----
-        self.COLOR_PRIMARY = "#2563EB"         # Blue-600
-        self.COLOR_PRIMARY_HOVER = "#1E40AF"   # Blue-800
-        self.COLOR_DANGER = "#DC2626"          # Red-600
-        self.COLOR_DANGER_HOVER = "#B91C1C"    # Red-700
-        self.COLOR_NEUTRAL = "#6B7280"         # Gray-500
-        self.COLOR_NEUTRAL_HOVER = "#4B5563"   # Gray-600
-        self.COLOR_ACCENT = "#F59E0B"          # Amber-500
-        self.COLOR_ACCENT_HOVER = "#D97706"    # Amber-600
-
         # Counters/labels
         self.shape_counts = {"heart": 0, "rectangle": 0, "circle": 0, "total": 0}
+        # เพิ่ม defect “รอยบวม, รอยไหม้” + ขยายฟอนต์ในตารางภายหลัง
         self.defect_data = [
             ("รอยแตก", "ยังไม่พบ", "green"),
             ("รูเข็ม", "ยังไม่พบ", "green"),
@@ -547,7 +402,7 @@ class LeafPlateDetectionApp:
         os.makedirs(self.save_root, exist_ok=True)
 
         # YOLO
-        self.MODEL_PATH = os.path.join(self.BASE_DIR, "best.pt")
+        self.MODEL_PATH = os.path.join(self.BASE_DIR, "best2.pt")
         self.model = None
         self.imgsz = 896
         self.conf_thr = 0.27
@@ -555,6 +410,7 @@ class LeafPlateDetectionApp:
 
         # class groups
         self.shape_classes = {"circle_leaf_plate", "heart_shaped_leaf_plate", "rectangular_leaf_plate"}
+        # รองรับ bulge/burn หากโมเดลมี
         self.defect_classes = {"crack", "hole", "bulge", "burn"}
         self.shape_map = {
             "heart_shaped_leaf_plate": "heart",
@@ -578,7 +434,7 @@ class LeafPlateDetectionApp:
         # gating
         self.lbl_heart = self.lbl_rect = self.lbl_circle = None
         self.gate_has_plate = False
-        ourFalse = False
+        theFalse = False
         self.gate_has_counted = False
         self.gate_present_frames = 0
         self.gate_absent_frames = 0
@@ -592,6 +448,7 @@ class LeafPlateDetectionApp:
 
     # ---------------- Tk error patch ----------------
     def _report_callback_exception(self, exc, val, tb):
+        """Avoid noisy stacktrace for KeyboardInterrupt during Tk callbacks."""
         import traceback
         if exc is KeyboardInterrupt or isinstance(val, KeyboardInterrupt):
             print("[INFO] KeyboardInterrupt in Tk callback (ignored). Use the UI buttons to stop.")
@@ -618,8 +475,7 @@ class LeafPlateDetectionApp:
     def _firebase_post(self, path, obj):
         payload = {
             **obj,
-            "_meta": {"source": "python-admin", "pushed_at": datetime.now(timezone.utc).isoformat(),
-                      "server_id": str(uuid.uuid4())}
+            "_meta": {"source": "python-admin", "pushed_at": datetime.now(timezone.utc).isoformat(), "server_id": str(uuid.uuid4())}
         }
         try:
             self._fb_init()
@@ -633,8 +489,7 @@ class LeafPlateDetectionApp:
             url = f"{self.firebase_base}/{path}.json"
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=5):
-                pass
+            with urllib.request.urlopen(req, timeout=5): pass
         except Exception as e:
             print(f"[Firebase] REST POST error: {e}")
 
@@ -651,8 +506,7 @@ class LeafPlateDetectionApp:
             url = f"{self.firebase_base}/{path}.json"
             data = json.dumps(obj).encode("utf-8")
             req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="PUT")
-            with urllib.request.urlopen(req, timeout=5):
-                pass
+            with urllib.request.urlopen(req, timeout=5): pass
         except Exception as e:
             print(f"[Firebase] REST PUT error: {e}")
 
@@ -736,22 +590,17 @@ class LeafPlateDetectionApp:
         button_frame = ctk.CTkFrame(left_frame, width=button_frame_w, height=60, fg_color="transparent")
         button_frame.place(x=self.cam_pad, y=self.cam_pad + self.cam_h + 15)
 
-        # ปุ่ม เริ่ม/หยุด : ใช้พาเลตใหม่
-        self.toggle_button = ctk.CTkButton(
-            button_frame, width=150, height=45, text="เริ่ม",
-            font=self.F(16, True), text_color="#FFFFFF",
-            fg_color=self.COLOR_PRIMARY, hover_color=self.COLOR_PRIMARY_HOVER,
-            command=self.toggle_data_collection
-        )
+        self.toggle_button = ctk.CTkButton(button_frame, width=150, height=45, text="เริ่ม",
+                                           font=self.F(16, True), text_color="#FFFFFF",
+                                           fg_color="#253BFA", hover_color="#0F0D69",
+                                           command=self.toggle_data_collection)
         self.toggle_button.place(x=0, y=5)
 
-        # ปุ่ม "รายงาน" เดียว -> popup ให้เลือก รายวัน/รายสัปดาห์
-        ctk.CTkButton(
-            button_frame, width=170, height=45, text="รายงาน",
-            font=self.F(16, True), text_color="#FFFFFF",
-            fg_color=self.COLOR_PRIMARY, hover_color=self.COLOR_PRIMARY_HOVER,
-            command=self.show_report_picker
-        ).place(x=button_frame_w - 170, y=5)
+        # ปุ่ม “รายงาน” -> เปิด Excel Viewer
+        ctk.CTkButton(button_frame, width=150, height=45, text="รายงาน",
+                      font=self.F(16, True), text_color="#FFFFFF",
+                      fg_color="#5BCADD", hover_color="#58AEBD",
+                      command=self.open_excel_viewer).place(x=button_frame_w - 150, y=5)
 
         # right
         right_x = self.M + self.left_w + self.GAP
@@ -768,48 +617,14 @@ class LeafPlateDetectionApp:
         bottom_frame.place(x=self.M, y=self.BOTTOM_Y)
         self.create_defect_table(bottom_frame)
 
-    # ----- popup เลือกประเภทรายงาน -----
-    def show_report_picker(self):
-        dlg = ctk.CTkToplevel(self.app)
-        dlg.title("เลือกรูปแบบรายงาน")
-        dlg.geometry("420x210")
-        dlg.resizable(False, False)
-        dlg.transient(self.app)
-        dlg.grab_set()
-
-        ctk.CTkLabel(dlg, text="ต้องการดูรายงานแบบใด?", font=self.F(20, True)).pack(pady=(18, 10))
-
-        row = ctk.CTkFrame(dlg, fg_color="transparent")
-        row.pack(pady=8)
-
-        # รายงาน (รายวัน)
-        ctk.CTkButton(
-            row, width=160, height=48, text="รายงาน (รายวัน)",
-            font=self.F(16, True), text_color="#FFFFFF",
-            fg_color=self.COLOR_PRIMARY, hover_color=self.COLOR_PRIMARY_HOVER,
-            command=lambda: (dlg.destroy(), self.open_excel_viewer())
-        ).pack(side="left", padx=8)
-
-        # รายงาน (รายสัปดาห์)
-        ctk.CTkButton(
-            row, width=160, height=48, text="รายงาน (รายสัปดาห์)",
-            font=self.F(16, True), text_color="#FFFFFF",
-            fg_color=self.COLOR_ACCENT, hover_color=self.COLOR_ACCENT_HOVER,
-            command=lambda: (dlg.destroy(), self.open_weekly_viewer())
-        ).pack(side="left", padx=8)
-
-        ctk.CTkButton(
-            dlg, text="ปิด", width=100,
-            font=self.F(14, True), text_color="#FFFFFF",
-            fg_color=self.COLOR_NEUTRAL, hover_color=self.COLOR_NEUTRAL_HOVER,
-            command=dlg.destroy
-        ).pack(pady=(10, 16))
-
     def metric_box(self, panel, x, box_w, box_h, box_y, emoji, emoji_font, title_text, title_color, count_label=None):
-        f = ctk.CTkFrame(panel, width=box_w, height=box_h, fg_color="#ffffff", corner_radius=18)
+        f = ctk.CTkFrame(panel, width=box_w, height=box_h,
+                         fg_color="#ffffff", corner_radius=18)
         f.place(x=x, y=box_y)
+        # แสดงรูปทรงสีๆ ด้านบน
         ctk.CTkLabel(f, text=emoji, font=emoji_font, text_color=title_color)\
             .place(x=box_w // 2, y=28, anchor="center")
+        # แสดงตัวเลขด้านล่าง
         if count_label:
             count_label.place(x=box_w // 2, y=90, anchor="center")
         return f
@@ -831,22 +646,33 @@ class LeafPlateDetectionApp:
         ctk.CTkLabel(panel, text="จานแต่ละรูปทรง", font=self.F(20, True),
                      text_color="#1a2a3a").place(x=panel_w // 2, y=180, anchor="center")
 
+        # ---------- cards (emoji + title + number) ----------
         box_w, box_h, box_y = 220, 120, 220
         gap = (panel_w - 3 * box_w) // 4
-        emoji_font = self._emoji_font(36)
+        emoji_font = self._emoji_font(36)  # ลดขนาดรูปทรงลง
 
-        f1 = self.metric_box(panel, gap, box_w, box_h, box_y, "♥", emoji_font, "หัวใจ", "#e74c3c")
+        # Heart - ใช้ข้อความหัวใจสีแดง
+        f1 = self.metric_box(panel, gap, box_w, box_h, box_y, 
+                 "♥", emoji_font, "หัวใจ", "#e74c3c")
+        # เพิ่มตัวเลขสำหรับหัวใจ
         self.lbl_heart = ctk.CTkLabel(f1, text="0", font=self.F(40, True), text_color="#102438")
         self.lbl_heart.place(x=box_w // 2, y=90, anchor="center")
-
-        f2 = self.metric_box(panel, gap * 2 + box_w, box_w, box_h, box_y, "▬", emoji_font, "สี่เหลี่ยมผืนผ้า", "#199129")
+        
+        # Rectangle - ใช้ข้อความสี่เหลี่ยมสีเขียว
+        f2 = self.metric_box(panel, gap * 2 + box_w, box_w, box_h, box_y, 
+             "▬", emoji_font, "สี่เหลี่ยมผืนผ้า", "#199129")
+        # เพิ่มตัวเลขสำหรับสี่เหลี่ยม
         self.lbl_rect = ctk.CTkLabel(f2, text="0", font=self.F(40, True), text_color="#102438")
         self.lbl_rect.place(x=box_w // 2, y=90, anchor="center")
-
-        f3 = self.metric_box(panel, gap * 3 + box_w * 2, box_w, box_h, box_y, "●", emoji_font, "วงกลม", "#2AA7B8")
+        
+        # Circle - ใช้ข้อความวงกลมสีน้ำเงิน
+        f3 = self.metric_box(panel, gap * 3 + box_w * 2, box_w, box_h, box_y, 
+                 "●", emoji_font, "วงกลม", "#2AA7B8")
+        # เพิ่มตัวเลขสำหรับวงกลม
         self.lbl_circle = ctk.CTkLabel(f3, text="0", font=self.F(40, True), text_color="#102438")
         self.lbl_circle.place(x=box_w // 2, y=90, anchor="center")
 
+        # ---------- summary card ----------
         summary_card_y = box_y + box_h + 30
         summary_card_h = panel_h - summary_card_y - 20
         summary_card_w = panel_w - 2 * gap
@@ -884,6 +710,7 @@ class LeafPlateDetectionApp:
         self.lbl_lot.place(x=value_x, y=start_y + row_h * 3, anchor="w")
         ctk.CTkLabel(summary, text="รหัสชุด:", font=self.F(16), text_color="#1a2a3a")\
             .place(x=label_x, y=start_y + row_h * 3, anchor="w")
+
 
     def create_defect_table(self, parent):
         table_w = self.bottom_w - 40
@@ -929,6 +756,7 @@ class LeafPlateDetectionApp:
         self._auto_xlsx_path = os.path.join(self.save_root, f"Report_{self._session_stamp}.xlsx")
         self._auto_json_path = os.path.join(self.save_root, f"Report_{self._session_stamp}.json")
 
+        # init Excel with title + start/end times on top, then header row
         wb = openpyxl.Workbook()
         sh = wb.active
         sh.title = "Report"
@@ -939,16 +767,19 @@ class LeafPlateDetectionApp:
         sh["A1"].font = Font(bold=True, size=13)
         sh["A1"].alignment = Alignment(horizontal="left", vertical="center")
 
+        # row 2: start/end times
         self.session_meta.setdefault("start_time", datetime.now().strftime("%H:%M:%S"))
         sh["A2"] = "เริ่มตรวจ:"; sh["A2"].font = Font(bold=True)
         sh["B2"] = self.session_meta["start_time"]
         sh["D2"] = "สิ้นสุด:";  sh["D2"].font = Font(bold=True)
-        sh["E2"] = "-"
+        sh["E2"] = "-"  # update later
 
+        # row 4: header
         head_row = 4
-        sh.append([])
+        sh.append([])  # row3 blank
         sh.append(self.EXCEL_HEADERS)
 
+        # style header
         head_font = Font(bold=True)
         fill = PatternFill("solid", fgColor="E4DFDA")
         align = Alignment(horizontal="center", vertical="center")
@@ -957,15 +788,18 @@ class LeafPlateDetectionApp:
         for c in range(1, len(self.EXCEL_HEADERS) + 1):
             cell = sh.cell(row=head_row, column=c)
             cell.font = head_font; cell.fill = fill; cell.alignment = align; cell.border = border
-            sh.column_dimensions[get_column_letter(c)].width = 22
-        sh.freeze_panes = "A5"
+            sh.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 22
+        sh.freeze_panes = "A5"  # lock header
 
         wb.save(self._auto_xlsx_path); wb.close()
 
+        # init JSON
         self._write_json_to_path(self._auto_json_path)
+
         self.firebase_session_key = self._session_stamp
 
     def _update_excel_session_times(self):
+        # อัปเดตเวลาเริ่ม/สิ้นสุดใน A2:B2 / D2:E2
         try:
             wb = openpyxl.load_workbook(self._auto_xlsx_path)
             sh = wb.active
@@ -991,6 +825,7 @@ class LeafPlateDetectionApp:
         sh.append(vals)
         wb.save(self._auto_xlsx_path)
         wb.close()
+        # keep end time fresh
         self._update_excel_session_times()
 
     def _write_json_to_path(self, path):
@@ -1048,8 +883,7 @@ class LeafPlateDetectionApp:
     def _render_latched_defect_counts(self):
         for en_name, th_name in self.defect_th_map.items():
             lbl = self.status_labels.get(th_name)
-            if not lbl:
-                continue
+            if not lbl: continue
             cnt = int(self._latched_defect_counts.get(en_name, 0))
             if cnt > 0:
                 lbl.configure(text=str(cnt), text_color="#e74c3c")
@@ -1059,8 +893,7 @@ class LeafPlateDetectionApp:
                 lbl.configure(text=default_status, text_color=status_color)
 
     def _set_plate_status(self, mode, defect_count=None):
-        if not self.lbl_plate_status:
-            return
+        if not self.lbl_plate_status: return
         if mode == "pending":
             pending_emoji = self._get_colored_emoji(":information_source:")
             self.lbl_plate_status.configure(text=f"{pending_emoji} ยังไม่ได้ตรวจ", text_color="#888888")
@@ -1098,8 +931,8 @@ class LeafPlateDetectionApp:
         row = {
             "date": self.thai_date(now),
             "time": now.strftime("%H:%M:%S"),
-            "plate_id": self.plate_id_counter,
-            "lot_id": self.lot_id,
+            "plate_id": self.plate_id_counter,  # จานที่
+            "lot_id": self.lot_id,              # เลขชุด
             "shape": shape_text,
             "defects": defects_text.strip(),
             "note": ""
@@ -1107,6 +940,7 @@ class LeafPlateDetectionApp:
         self.plate_id_counter += 1
         self.session_rows.append(row)
 
+        # autosave to Excel & JSON & Firebase
         self._ensure_session_files()
         self._append_excel_row(row)
         self._write_json_to_path(self._auto_json_path)
@@ -1114,7 +948,10 @@ class LeafPlateDetectionApp:
         meta = {
             "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self._title_date(datetime.now())}",
             "lot_id": self.lot_id,
-            "session": {"start_time": self.session_meta.get("start_time"), "end_time": datetime.now().strftime("%H:%M:%S")}
+            "session": {
+                "start_time": self.session_meta.get("start_time"),
+                "end_time": datetime.now().strftime("%H:%M:%S")
+            }
         }
         self._firebase_put(f"sessions/{self.firebase_session_key}/meta", meta)
         self._firebase_post(f"sessions/{self.firebase_session_key}/records", row)
@@ -1180,6 +1017,7 @@ class LeafPlateDetectionApp:
                 annotated, shapes_found, defect_counts, defect_names = self._annotate_and_summarize(frame_resized, res)
                 frame_to_show = annotated
 
+                # latched counts and gating
                 plate_detected = (len(shapes_found) > 0) or (len(defect_names) > 0)
                 if plate_detected:
                     for k, v in defect_counts.items():
@@ -1197,6 +1035,7 @@ class LeafPlateDetectionApp:
                     self._reset_defect_table(); self._render_latched_defect_counts()
 
                 if self.gate_has_plate and (not self.gate_has_counted) and self.gate_present_frames >= self.gate_present_thresh:
+                    # count
                     if shapes_found:
                         for shp in shapes_found:
                             if shp in self.shape_counts:
@@ -1205,6 +1044,7 @@ class LeafPlateDetectionApp:
                     elif len(defect_names) > 0:
                         self.shape_counts["total"] += 1
 
+                    # update UI counters
                     self.total_number_label.configure(text=str(self.shape_counts["total"]))
                     self.lbl_plate_order.configure(text=str(self.shape_counts["total"]))
                     self.lbl_heart.configure(text=str(self.shape_counts["heart"]))
@@ -1215,7 +1055,8 @@ class LeafPlateDetectionApp:
                     defect_count = sum(defect_counts.values())
                     self._set_plate_status("counted", defect_count)
                     self.gate_has_counted = True
-
+                    
+                    # Log การตรวจจับสำเร็จ
                     if defect_count > 0:
                         self._log_with_emoji("warning", f"พบตำหนิ {defect_count} จุด ในจานที่ {self.plate_id_counter-1}")
                     else:
@@ -1251,13 +1092,14 @@ class LeafPlateDetectionApp:
                 messagebox.showerror("Model Error", "ยังโหลดโมเดลไม่สำเร็จ"); return
             self.is_collecting_data = True
             self.session_meta.setdefault("start_time", datetime.now().strftime("%H:%M:%S"))
-            # ปุ่ม: เปลี่ยนเป็น danger ตอนกำลังตรวจ
-            self.toggle_button.configure(text="หยุด", fg_color=self.COLOR_DANGER, hover_color=self.COLOR_DANGER_HOVER)
+            self.toggle_button.configure(text="หยุด", fg_color="#e74c3c", hover_color="#c0392b")
             self.gate_has_plate = self.gate_has_counted = False
             self.gate_present_frames = self.gate_absent_frames = 0
             self._set_plate_status("pending")
             self._reset_defect_table(); self._render_latched_defect_counts()
-            self._ensure_session_files(); self._update_excel_session_times()
+            # ensure workbook created with start time
+            self._ensure_session_files()
+            self._update_excel_session_times()
             self._log_with_emoji("success", "เริ่มการตรวจสอบจานใบไม้")
         else:
             self.show_stop_confirm_dialog()
@@ -1269,37 +1111,36 @@ class LeafPlateDetectionApp:
         warning_emoji = self._get_colored_emoji(":warning:")
         ctk.CTkLabel(dlg, text=f"{warning_emoji} คุณยืนยันจะหยุดตรวจและบันทึกรายงานหรือไม่?", font=self.F(16, True))\
             .place(x=190, y=55, anchor="center")
-        ctk.CTkButton(
-            dlg, width=140, height=40, text="Submit (ยืนยัน)", font=self.F(14, True),
-            fg_color=self.COLOR_PRIMARY, hover_color=self.COLOR_PRIMARY_HOVER,
-            command=lambda: (dlg.destroy(), self.stop_and_finalize())
-        ).place(x=40, y=110)
-        ctk.CTkButton(
-            dlg, width=140, height=40, text="ตรวจต่อ", font=self.F(14, True),
-            fg_color=self.COLOR_NEUTRAL, hover_color=self.COLOR_NEUTRAL_HOVER,
-            command=dlg.destroy
-        ).place(x=200, y=110)
+        ctk.CTkButton(dlg, width=140, height=40, text="Submit (ยืนยัน)", font=self.F(14, True),
+                      fg_color="#27ae60", hover_color="#1e8449",
+                      command=lambda: (dlg.destroy(), self.stop_and_finalize())).place(x=40, y=110)
+        ctk.CTkButton(dlg, width=140, height=40, text="ตรวจต่อ", font=self.F(14, True),
+                      fg_color="#95a5a6", hover_color="#7f8c8d",
+                      command=dlg.destroy).place(x=200, y=110)
 
     def stop_and_finalize(self):
         self.is_collecting_data = False
         self._log_with_emoji("info", "หยุดการตรวจสอบจานใบไม้")
         try:
-            # กลับเป็นปุ่มเริ่ม (primary)
-            self.toggle_button.configure(text="เริ่ม", fg_color=self.COLOR_PRIMARY, hover_color=self.COLOR_PRIMARY_HOVER)
+            self.toggle_button.configure(text="เริ่ม", fg_color="#253BFA", hover_color="#0F0D69")
         except Exception:
             pass
 
+        # ปรับ end_time ในไฟล์ล่าสุด
         if self._session_stamp:
             self._update_excel_session_times()
             meta = {
                 "report_title": f"รายงานการตรวจจานใบไม้ วันที่ {self._title_date(datetime.now())}",
                 "lot_id": self.lot_id,
-                "session": {"start_time": self.session_meta.get("start_time"),
-                            "end_time": datetime.now().strftime("%H:%M:%S")}
+                "session": {
+                    "start_time": self.session_meta.get("start_time"),
+                    "end_time": datetime.now().strftime("%H:%M:%S")
+                }
             }
             self._firebase_put(f"sessions/{self.firebase_session_key}/meta", meta)
             self._log_with_emoji("success", "บันทึกรายงานเรียบร้อย")
 
+        # reset to next lot
         self._reset_all_and_next_lot()
 
     def _reset_all_and_next_lot(self):
@@ -1327,6 +1168,7 @@ class LeafPlateDetectionApp:
         self.gate_present_frames = self.gate_absent_frames = 0
         self._set_plate_status("pending")
         self._reset_defect_table(); self._render_latched_defect_counts()
+
         self._increment_lot_id()
 
     def update_header_time(self):
@@ -1342,155 +1184,7 @@ class LeafPlateDetectionApp:
         self.stop_camera()
         self.app.destroy()
 
-    # ---------------- Excel Viewer launchers ----------------
-    def open_excel_viewer(self):
-        ExcelViewerDialog(self.app, self.save_root, title="Excel Viewer")
-
-    def open_weekly_viewer(self):
-        # สร้าง/อัปเดตรายงานรายสัปดาห์ของสัปดาห์ปัจจุบันก่อนเปิด
-        start_d, end_d = self._get_week_range_mon_sun(date.today())
-        self._ensure_weekly_report(start_d, end_d)
-        WeeklyExcelViewerDialog(self.app, self.save_root, title="Excel Viewer - Weekly")
-
-    # ---------------- Weekly report helpers ----------------
-    @staticmethod
-    def _get_week_range_mon_sun(d: date):
-        """คืนค่า (วันจันทร์, วันอาทิตย์) ของสัปดาห์ที่ d อยู่"""
-        mon = d - timedelta(days=(d.weekday()))       # Monday
-        sun = mon + timedelta(days=6)                 # Sunday
-        return mon, sun
-
-    @staticmethod
-    def _thai_weekday_name(d: date):
-        names = ["วันจันทร์", "วันอังคาร", "วันพุธ", "วันพฤหัสบดี", "วันศุกร์", "วันเสาร์", "วันอาทิตย์"]
-        return names[d.weekday()]
-
-    @staticmethod
-    def _parse_thai_date(s: str) -> date:
-        # รูปแบบ dd/mm/BBBB (พ.ศ.)
-        try:
-            dd, mm, bb = s.split("/")
-            return date(int(bb) - 543, int(mm), int(dd))
-        except Exception:
-            return None
-
-    def _ensure_weekly_report(self, start_d: date, end_d: date):
-        fname = f"Weekly_{start_d.strftime('%Y%m%d')}-{end_d.strftime('%Y%m%d')}.xlsx"
-        fpath = os.path.join(self.save_root, fname)
-        try:
-            self._build_weekly_excel(fpath, start_d, end_d)
-        except Exception as e:
-            messagebox.showerror("Weekly Report", f"สร้างรายงานรายสัปดาห์ไม่สำเร็จ:\n{e}")
-
-    def _build_weekly_excel(self, path, start_d: date, end_d: date):
-        """อ่านไฟล์รายวันทั้งหมดในโฟลเดอร์ -> สรุปเป็นรายสัปดาห์ [จันทร์-อาทิตย์]
-           'หัววัน' จะเป็นชื่อวันอย่างเดียว (ไม่มีตัวเลขวันที่)
-        """
-        stats = {}
-        defect_counter = defaultdict(Counter)
-
-        for rp in glob.glob(os.path.join(self.save_root, "Report_*.xlsx")):
-            wb = openpyxl.load_workbook(rp, data_only=True)
-            sh = wb.active
-            head_r = 1
-            for r in range(1, min(30, sh.max_row) + 1):
-                if (sh.cell(row=r, column=1).value or "") == "วันที่":
-                    head_r = r
-                    break
-            for r in range(head_r + 1, sh.max_row + 1):
-                d_th = sh.cell(row=r, column=1).value
-                lot = sh.cell(row=r, column=4).value
-                defects = sh.cell(row=r, column=6).value
-                if not d_th or not lot:
-                    continue
-                gd = self._parse_thai_date(str(d_th))
-                if gd is None:
-                    continue
-                if not (start_d <= gd <= end_d):
-                    continue
-
-                key = (gd, str(lot))
-                st = stats.setdefault(key, {"total": 0, "ok": 0, "ng": 0})
-                st["total"] += 1
-                if defects and str(defects).strip() not in ("-", ""):
-                    st["ng"] += 1
-                    for token in [t.strip() for t in str(defects).split("/") if t.strip()]:
-                        defect_counter[key][token] += 1
-                else:
-                    st["ok"] += 1
-            wb.close()
-
-        wb = openpyxl.Workbook()
-        sh = wb.active
-        sh.title = "Weekly"
-
-        title = f"รายงานการตรวจจานใบไม้ ช่วงวันที่ {start_d.strftime('%d/%m/%y')} - {end_d.strftime('%d/%m/%y')}"
-        sh.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
-        sh["A1"] = title
-        sh["A1"].font = Font(size=14, bold=True)
-        sh["A1"].alignment = Alignment(horizontal="center")
-
-        headers = ["วันที่", "รหัสชุด", "จำนวนจานทั้งหมด", "ไม่มีตำหนิ", "มีตำหนิ", "ตำหนิที่พบบ่อยที่สุด", "หมายเหตุ"]
-        sh.append([])
-        sh.append(headers)
-        head_row = 3
-        head_font = Font(bold=True)
-        fill = PatternFill("solid", fgColor="E4DFDA")
-        align = Alignment(horizontal="center", vertical="center")
-        thin = Side(style="thin", color="B7B7B7")
-        border = Border(left=thin, right=thin, top=thin, bottom=thin)
-        for c in range(1, len(headers) + 1):
-            cell = sh.cell(row=head_row, column=c)
-            cell.font = head_font; cell.fill = fill; cell.alignment = align; cell.border = border
-            sh.column_dimensions[get_column_letter(c)].width = 22
-
-        r = head_row + 1
-        total_all, ok_all, ng_all = 0, 0, 0
-        cur = start_d
-        while cur <= end_d:
-            # ---- แถวหัววัน (ชื่อวันอย่างเดียว) ----
-            day_bar = self._thai_weekday_name(cur)
-            sh.merge_cells(start_row=r, start_column=1, end_row=r, end_column=7)
-            cell = sh.cell(row=r, column=1, value=day_bar)
-            # หัววันสีเทาอ่อน
-            cell.font = Font(bold=True, color="333333")
-            cell.fill = PatternFill("solid", fgColor="E6E6E6")
-            cell.alignment = Alignment(horizontal="left")
-            r += 1
-
-            day_keys = sorted([k for k in stats.keys() if k[0] == cur], key=lambda x: x[1])
-            for key in day_keys:
-                gd, lot = key
-                st = stats[key]
-                total_all += st["total"]; ok_all += st["ok"]; ng_all += st["ng"]
-                most = "-"
-                if defect_counter[key]:
-                    most = defect_counter[key].most_common(1)[0][0]
-
-                sh.append([
-                    gd.strftime("%d/%m/%Y"),
-                    lot,
-                    st["total"],
-                    st["ok"],
-                    st["ng"],
-                    most,
-                    ""
-                ])
-                r += 1
-
-            cur += timedelta(days=1)
-
-        sh.append(["รวมทั้งหมด", "", total_all, ok_all, ng_all, "", ""])
-        sum_row = sh.max_row
-        sh.cell(row=sum_row, column=1).font = Font(bold=True)
-        sh.cell(row=sum_row, column=3).font = Font(bold=True)
-        sh.cell(row=sum_row, column=4).font = Font(bold=True)
-        sh.cell(row=sum_row, column=5).font = Font(bold=True)
-
-        wb.save(path)
-        wb.close()
-
-    # ---------------- Excel Viewer launchers (ใช้งานใน popup) ----------------
+    # ---------------- Excel Viewer launcher ----------------
     def open_excel_viewer(self):
         ExcelViewerDialog(self.app, self.save_root, title="Excel Viewer")
 
@@ -1503,13 +1197,14 @@ class LeafPlateDetectionApp:
 # Boot
 # ================================
 if __name__ == "__main__":
+    # Ignore Ctrl+C in console while GUI running; use in-app buttons
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     except Exception:
         pass
 
     print("🚀 กำลังเริ่มต้นโปรแกรมตรวจจับรอยตำหนิบนจานใบไม้...")
-
+    
     app = LeafPlateDetectionApp()
     app.initialize_data()
     app.setup_app()
@@ -1518,9 +1213,9 @@ if __name__ == "__main__":
     app.setup_model()
     app.create_widgets()
     app.start_camera()
-
+    
     print("✅ โปรแกรมพร้อมใช้งาน!")
-
+    
     try:
         app.run()
     except KeyboardInterrupt:
