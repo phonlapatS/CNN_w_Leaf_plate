@@ -1,19 +1,13 @@
-# Core GUI + inference
-customtkinter
-numpy
-pillow
-opencv-python
-ultralytics>=8.1
-
-# Fix: unicode emoji labels
-emojis==0.7.0
-
-# Firebase (ใช้ Admin SDK) – ผูกกับ protobuf 4.x ได้
-firebase-admin>=6.5,<7
-
-# ปักหมุด Protobuf ให้เข้ากับ firebase-admin และไม่ชน TF
-protobuf==4.21.12
-
-# ป้องกัน gRPC ดึงเวอร์ชันที่บังคับ protobuf 6.x มา
-grpcio==1.57.0
-grpcio-status==1.57.0
+customtkinter>=5.2
+ultralytics>=8.2
+opencv-python>=4.9
+pillow>=10.0
+firebase-admin>=6.2
+openpyxl>=3.1
+numpy>=1.24
+emojis>=0.7
+colorama>=0.4
+# PyTorch จะถูกติดตั้งมาพร้อม ultralytics
+# ถ้าต้องการปักหมุดเอง ให้เพิ่ม เช่น:
+# torch==2.5.* 
+# torchvision==0.20.*
