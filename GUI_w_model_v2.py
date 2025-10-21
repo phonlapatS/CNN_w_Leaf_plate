@@ -534,19 +534,24 @@ class LeafPlateDetectionApp:
             self.cap = cv2.VideoCapture(0)
         if not self.cap or not self.cap.isOpened():
             print("Cannot open camera"); self.cap = None; return
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
     def setup_model(self):
         try:
             self.model = YOLO(self.MODEL_PATH)
             self._log_with_emoji("success", "โมเดล YOLO โหลดสำเร็จ")
+            # << เพิ่มตรงนี้ >>
+            try:
+                print("[MODEL] classes =", self.model.names)
+            except Exception:
+                pass
+            # << จบที่นี่ >>
         except Exception as e:
             self._log_with_emoji("error", f"โหลดโมเดลไม่สำเร็จ: {e}")
             messagebox.showerror("Model Error", f"โหลดโมเดลไม่สำเร็จ:\n{e}")
             self.model = None
-
-    # ---------------- UI ----------------
+        # ---------------- UI ----------------
     def create_widgets(self):
         self.create_header()
         self.create_main_content()
@@ -845,6 +850,42 @@ class LeafPlateDetectionApp:
             print(f"Write JSON error: {e}")
 
     # ---------------- Helpers ----------------
+    
+    def _shape_hint_from_geometry(self, roi_bgr):
+
+        if roi_bgr is None or roi_bgr.size == 0:
+            return None
+        try:
+            gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            thr = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY_INV)[1]
+            cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                return None
+            c = max(cnts, key=cv2.contourArea)
+            A = cv2.contourArea(c)
+            if A < 50:   # เลี่ยงจุดรบกวนเล็ก ๆ
+                return None
+            P = cv2.arcLength(c, True) + 1e-6
+            circularity = 4.0 * np.pi * A / (P * P)  # ~1.0 = กลม
+
+            x, y, w, h = cv2.boundingRect(c)
+            rect_area = float(w * h) + 1e-6
+            rectangularity = A / rect_area         # ~1.0 = เติมเต็มสี่เหลี่ยม
+            ar = w / float(h)
+
+            # เกณฑ์หยาบที่ใช้งานจริงได้ดี
+            if circularity > 0.80 and 0.85 <= ar <= 1.15:
+                return "circle"
+            if rectangularity > 0.86 and (ar < 0.80 or ar > 1.20):
+                return "rectangle"
+            if circularity < 0.78 and rectangularity < 0.88:
+                return "heart"
+        except Exception:
+            pass
+        return None
+
+    
     def thai_date(self, dt):  # 11/09/2568
         return dt.strftime(f"%d/%m/{dt.year + 543}")
 
@@ -960,32 +1001,137 @@ class LeafPlateDetectionApp:
 
     # ---------------- Detection ----------------
     def _annotate_and_summarize(self, frame_bgr, res):
+ 
         annotated = frame_bgr.copy()
         shapes_found, defect_names = set(), set()
         defect_counts = {}
-
+    
+        # กันเคสไม่มีกล่อง
         if not hasattr(res, "boxes") or res.boxes is None:
             return annotated, shapes_found, defect_counts, defect_names
-
-        names = self.model.names
+    
+        names = self.model.names  # YOLO class id -> name
         boxes = res.boxes
-        xyxy = boxes.xyxy.cpu().numpy().astype(int)
+        xyxy = boxes.xyxy.cpu().numpy()
         clss = boxes.cls.cpu().numpy().astype(int)
         conf = boxes.conf.cpu().numpy()
-
+    
+        # ---------- utils ----------
+        def iou_xyxy(a, b):
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            inter_x1 = max(ax1, bx1)
+            inter_y1 = max(ay1, by1)
+            inter_x2 = min(ax2, bx2)
+            inter_y2 = min(ay2, by2)
+            iw = max(0.0, inter_x2 - inter_x1)
+            ih = max(0.0, inter_y2 - inter_y1)
+            inter = iw * ih
+            area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            union = area_a + area_b - inter
+            return (inter / union) if union > 0 else 0.0
+    
+        def classwise_nms(dets, iou_thr):
+            """
+            dets: list of dict {label, conf, xyxy(tuple)}
+            return kept list after doing greedy NMS PER CLASS
+            """
+            by_label = {}
+            for d in dets:
+                by_label.setdefault(d["label"], []).append(d)
+    
+            kept = []
+            for lbl, arr in by_label.items():
+                arr.sort(key=lambda x: x["conf"], reverse=True)
+                used = []
+                for d in arr:
+                    suppress = False
+                    for k in used:
+                        if iou_xyxy(d["xyxy"], k["xyxy"]) >= iou_thr:
+                            suppress = True
+                            break
+                    if not suppress:
+                        used.append(d)
+                kept.extend(used)
+            return kept
+    
+        # เตรียมดีเทคทั้งหมด
+        dets = []
         for (x1, y1, x2, y2), c, p in zip(xyxy, clss, conf):
             label = names.get(int(c), str(c))
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv2.putText(annotated, f"{label} {p:.2f}", (x1, max(20, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 255), 2, cv2.LINE_AA)
-
+            dets.append({"label": label,
+                         "conf": float(p),
+                         "xyxy": (float(x1), float(y1), float(x2), float(y2))})
+    
+        # ---------- NMS แยกตามคลาส ----------
+        kept = classwise_nms(dets, getattr(self, "iou_thr", 0.65))
+    
+        # reverse map: "heart"/"rectangle"/"circle" -> ชื่อคลาสโมเดล
+        if not hasattr(self, "_rev_shape_map"):
+            self._rev_shape_map = {}
+            for k, v in self.shape_map.items():
+                # ถ้าชื่อในโมเดลซ้ำหลายตัวกับ v จะเก็บตัวแรก
+                self._rev_shape_map.setdefault(v, k)
+    
+        # กำหนดเกณฑ์การทับด้วย geometry hint
+        # - ต่ำกว่า low: override ได้เต็มที่
+        # - ระหว่าง low..high: override ถ้า hint ไม่ตรงกับที่โมเดลทำนาย
+        geom_low = getattr(self, "shape_geom_low", 0.62)
+        geom_high = getattr(self, "shape_geom_high", 0.78)
+    
+        # ---------- วาด + นับ ----------
+        for d in kept:
+            label = d["label"]
+            p = d["conf"]
+            (x1, y1, x2, y2) = map(int, d["xyxy"])
+    
+            # ถ้าเป็น "shape class" → ให้มีสิทธิ์ใช้ geometry hint
             if label in self.shape_classes:
-                shapes_found.add(self.shape_map[label])
-            if label in self.defect_classes:
+                final_label = label
+    
+                # geometry hint เฉพาะตอนความมั่นใจยังไม่สูง
+                if p < geom_high:
+                    # crop ROI แล้วเดา geometry
+                    x1c, y1c = max(0, x1), max(0, y1)
+                    x2c, y2c = min(annotated.shape[1], x2), min(annotated.shape[0], y2)
+                    roi = annotated[y1c:y2c, x1c:x2c]
+                    hint = self._shape_hint_from_geometry(roi)  # -> "heart"/"rectangle"/"circle"/None
+    
+                    if hint is not None:
+                        # แปลง hint -> class name ของโมเดล
+                        hint_label = self._rev_shape_map.get(hint, None)
+                        if hint_label is not None:
+                            # ถ้ามั่นใจต่ำมาก (p < low) หรือ hint ขัดกับสิ่งที่โมเดลทำนาย ให้ override
+                            if (p < geom_low) or (self.shape_map.get(label) != hint):
+                                final_label = hint_label
+    
+                # วาดกรอบสีน้ำเงิน
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 102, 255), 2)
+                cv2.putText(
+                    annotated, f"{final_label} {p:.2f}",
+                    (x1, max(20, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 102, 255), 2, cv2.LINE_AA
+                )
+    
+                # เก็บผลในเชิงตรรกะ (เป็นคีย์ภายใน: heart/rectangle/circle)
+                shapes_found.add(self.shape_map.get(final_label, final_label))
+    
+            # ถ้าเป็น defect class → วาดแดง + นับ
+            elif label in self.defect_classes:
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                cv2.putText(
+                    annotated, f"{label} {p:.2f}",
+                    (x1, max(20, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 255), 2, cv2.LINE_AA
+                )
                 defect_names.add(label)
                 defect_counts[label] = defect_counts.get(label, 0) + 1
-
+    
+            # อื่น ๆ (คลาสที่เราไม่สนใจ) ก็ข้าม
+    
         return annotated, shapes_found, defect_counts, defect_names
+
 
     # ---------------- Camera loop ----------------
     def start_camera(self):
